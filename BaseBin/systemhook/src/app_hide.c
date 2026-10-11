@@ -32,9 +32,11 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
+#include <mach/vm_map.h>
 #include <mach/task_info.h>
 #include <mach/vm_region.h>
+// NOTE: <mach/mach_vm.h> is unusable on iOS ("mach_vm.h unsupported."), so the
+// protection dance below uses the vm_* API - vm_address_t is 64 bit on arm64. 
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
 #include <mach-o/loader.h>
@@ -218,27 +220,27 @@ static bool app_hide_write_string(void *dst, const char *text, size_t len)
 	vm_size_t span = (vm_size_t)(((addr + len) - page + pageSize - 1) & ~(pageSize - 1));
 
 	vm_region_basic_info_data_64_t info;
-	mach_vm_size_t regionSize = 0;
+	vm_size_t regionSize = 0;
 	mach_port_t objectName = MACH_PORT_NULL;
 	mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
 	vm_address_t regionAddr = page;
 
-	if (mach_vm_region(mach_task_self(), &regionAddr, &regionSize, VM_REGION_BASIC_INFO_64,
+	if (vm_region_64(mach_task_self(), &regionAddr, &regionSize, VM_REGION_BASIC_INFO_64,
 			(vm_region_info_t)&info, &infoCount, &objectName) != KERN_SUCCESS) {
 		return false;
 	}
 
 	vm_prot_t writable = info.protection | VM_PROT_WRITE;
-	if (mach_vm_protect(mach_task_self(), page, span, false, writable | VM_PROT_COPY) != KERN_SUCCESS) {
+	if (vm_protect(mach_task_self(), page, span, false, writable | VM_PROT_COPY) != KERN_SUCCESS) {
 		// regions that are already private and writable can reject VM_PROT_COPY
-		if (mach_vm_protect(mach_task_self(), page, span, false, writable) != KERN_SUCCESS) {
+		if (vm_protect(mach_task_self(), page, span, false, writable) != KERN_SUCCESS) {
 			return false;
 		}
 	}
 
 	memcpy(dst, text, len);
 
-	mach_vm_protect(mach_task_self(), page, span, false, info.protection);
+	vm_protect(mach_task_self(), page, span, false, info.protection);
 	return true;
 }
 
