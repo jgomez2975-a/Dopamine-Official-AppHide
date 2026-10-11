@@ -42,20 +42,12 @@
     void (^work)(void) = ^{
         NSString *path = APP_HIDE_RULES_PATH;
 
-        NSError *serError = nil;
-        NSData *data = [NSData dataWithPropertyList:rules
-                                            format:NSPropertyListXMLFormat_v1_0
-                                           options:0
-                                             error:&serError];
-        if (!data) {
-            writeError = [NSError errorWithDomain:@"AppHide" code:1 userInfo:@{
-                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"failed to serialise rules: %@", serError]
-            }];
-            NSLog(@"[AppHide] failed to serialise rules: %@", serError);
-            return;
-        }
-
-        if (![data writeToFile:path atomically:NO]) {
+        // -[NSDictionary writeToFile:atomically:] emits an XML property list for
+        // plist-able contents and reports the reason through errno, which is the
+        // only signal that separates "sandbox blocked the write" (EPERM) from
+        // "the filesystem is read-only" (EROFS). Keep errno for the alert text.
+        errno = 0;
+        if (![rules writeToFile:path atomically:YES]) {
             int err = errno;
             NSLog(@"[AppHide] failed to write %@: %@ (errno %d)", path, strerror(err), err);
             writeError = [NSError errorWithDomain:@"AppHide" code:err userInfo:@{
