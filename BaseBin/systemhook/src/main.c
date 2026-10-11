@@ -207,6 +207,13 @@ bool should_enable_tweaks(void)
 			return false;
 		}
 	}
+	char *appHideEnv = getenv("DOPAMINE_APP_HIDE");
+	if (appHideEnv && !strcmp(appHideEnv, "1")) {
+		// App Hide: launchdhook marked this process as "jailbreak invisible",
+		// so no tweak may be loaded into it.
+		return false;
+	}
+
 
 	if (jbclient_dopamine_is_jailbroken(NULL)) {
 		// Probe whether we are the Dopamine app

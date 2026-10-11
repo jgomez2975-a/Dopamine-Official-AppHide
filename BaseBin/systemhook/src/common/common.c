@@ -16,6 +16,9 @@
 #include <libjailbreak/jbroot.h>
 #include <libjailbreak/hookd.h>
 #include <libkern/OSCacheControl.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 
 bool string_has_prefix(const char *str, const char* prefix)
 {
@@ -118,6 +121,72 @@ xpc_object_t jbuserconfig_get_value(const char *key)
 	return NULL;
 }
 
+
+// ==== App Hide: per-app jailbreak hiding ====================================
+// Rules file (written by the Dopamine app, see DOAppHide.m):
+//   <CFBundleIdentifier> -> { HideEnvironment: bool, HideNoInject: bool }
+#define APP_HIDE_RULES_PATH "/var/mobile/Library/Preferences/.DopamineAppHideRules.plist"
+
+// Cached rules load, invalidated by mtime (same pattern as jbuserconfig_get_value)
+static bool app_hide_rules_for_bundle_id(const char *bundleID, bool *outNoInject)
+{
+	if (outNoInject) *outNoInject = false;
+	if (!bundleID) return false;
+	if (access(APP_HIDE_RULES_PATH, R_OK) != 0) return false;
+
+	static xpc_object_t rulesDict = NULL;
+	static struct timespec lastRulesWrite = { .tv_sec = 0, .tv_nsec = 0 };
+
+	struct stat rulesStat = {};
+	if (stat(APP_HIDE_RULES_PATH, &rulesStat) != 0) return false;
+	if (timespec_compare(&rulesStat.st_mtimespec, &lastRulesWrite) > 0) {
+		lastRulesWrite = rulesStat.st_mtimespec;
+		if (rulesDict) xpc_release(rulesDict);
+		rulesDict = xpc_object_from_plist(APP_HIDE_RULES_PATH);
+	}
+	if (!rulesDict || xpc_get_type(rulesDict) != XPC_TYPE_DICTIONARY) return false;
+
+	xpc_object_t entry = xpc_dictionary_get_value(rulesDict, bundleID);
+	if (!entry || xpc_get_type(entry) != XPC_TYPE_DICTIONARY) return false;
+
+	if (outNoInject) *outNoInject = xpc_dictionary_get_bool(entry, "HideNoInject");
+	return xpc_dictionary_get_bool(entry, "HideEnvironment");
+}
+
+// An app executable lives at
+//   /[private/]var/containers/Bundle/Application/<UUID>/<Name>.app/<Name>
+// so its bundle id is read straight from the sibling Info.plist.
+static char *app_hide_bundle_id_for_executable(const char *path)
+{
+	if (!path) return NULL;
+
+	const char *applicationDirMarker = strstr(path, "/Bundle/Application/");
+	if (!applicationDirMarker) return NULL;
+
+	const char *appDir = strchr(applicationDirMarker + strlen("/Bundle/Application/"), '/');
+	if (!appDir) return NULL;
+
+	const char *appDirEnd = strchr(appDir + 1, '/');
+	if (!appDirEnd) return NULL;
+	if ((size_t)(appDirEnd - (appDir + 1)) < 4) return NULL;
+	if (strncmp(appDirEnd - 4, ".app", 4) != 0) return NULL;
+
+	char infoPath[PATH_MAX];
+	snprintf(infoPath, sizeof(infoPath), "%.*s/Info.plist", (int)(appDirEnd - path), path);
+
+	char *bundleID = NULL;
+	xpc_object_t infoDict = xpc_object_from_plist(infoPath);
+	if (infoDict) {
+		if (xpc_get_type(infoDict) == XPC_TYPE_DICTIONARY) {
+			const char *bundleIDString = xpc_dictionary_get_string(infoDict, "CFBundleIdentifier");
+			if (bundleIDString) bundleID = strdup(bundleIDString);
+		}
+		xpc_release(infoDict);
+	}
+	return bundleID;
+}
+// ==== end App Hide ==========================================================
+
 static kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[restrict])
 {
 	// Blacklist to ensure general system stability
@@ -170,6 +239,12 @@ static int spawn_exec_hook_common(bool isExec,
 	if (desc) attr = desc->attrp;
 
 	kSpawnConfig spawnConfig = spawn_config_for_executable(path, argv);
+	char *appHideBundleID = app_hide_bundle_id_for_executable(path);
+	bool appHideNoInject = false;
+	bool shouldHideAppEnv = appHideBundleID
+	                      ? app_hide_rules_for_bundle_id(appHideBundleID, &appHideNoInject)
+	                      : false;
+	if (appHideBundleID) free(appHideBundleID);
 
 	if (spawnConfig & kSpawnConfigTrust) {
 		// Upload binary to trustcache if needed
@@ -197,6 +272,14 @@ static int spawn_exec_hook_common(bool isExec,
 			shouldInsertJBEnv = false;
 			break;
 		}
+		if (shouldHideAppEnv && appHideNoInject) {
+			// App Hide / NoInject: this app gets no dylib at all, instead of going through
+			// the "remove the hook dylib" path below (that path would still normalise the
+			// jailbreak environment variables in a way that leaves traces of the env).
+			shouldInsertJBEnv = false;
+			break;
+		}
+
 
 		// Check if we can find a _SafeMode or _MSSafeMode variable
 		// In this case we do not want to inject anything
@@ -296,7 +379,7 @@ static int spawn_exec_hook_common(bool isExec,
 
 	pid_t childPid = -1;
 
-	if ((shouldInsertJBEnv && JBEnvAlreadyInsertedCount == 1) || (!shouldInsertJBEnv && JBEnvAlreadyInsertedCount == 0 && !hasSafeModeVariable)) {
+	if ((shouldInsertJBEnv && JBEnvAlreadyInsertedCount == 1) || (!shouldInsertJBEnv && JBEnvAlreadyInsertedCount == 0 && !hasSafeModeVariable && !shouldHideAppEnv)) {
 		// we're already good, just call orig
 		r = orig(&childPid, envp);
 	}
@@ -343,6 +426,17 @@ static int spawn_exec_hook_common(bool isExec,
 					free(newLibraryInsert);
 				}
 			}
+			envbuf_unsetenv(&envc, "_SafeMode");
+			envbuf_unsetenv(&envc, "_MSSafeMode");
+		}
+
+		if (shouldHideAppEnv && shouldInsertJBEnv) {
+			// App Hide: inject systemhook only, and tell it (DOPAMINE_APP_HIDE) that the
+			// jailbreak has to stay invisible inside this process. DYLD_IN_CACHE=0 is what
+			// makes dyld honour the insert instead of rejecting it as a shared cache image.
+			envbuf_setenv(&envc, "DYLD_INSERT_LIBRARIES", HOOK_DYLIB_PATH);
+			envbuf_setenv(&envc, "DOPAMINE_APP_HIDE", "1");
+			envbuf_setenv(&envc, "DYLD_IN_CACHE", "0");
 			envbuf_unsetenv(&envc, "_SafeMode");
 			envbuf_unsetenv(&envc, "_MSSafeMode");
 		}

@@ -253,6 +253,8 @@
 		8CF3E8662F72D57800931CA8 /* DarkSword.m in Sources */ = {isa = PBXBuildFile; fileRef = 8CF3E85B2F72D50200931CA8 /* DarkSword.m */; };
 		8CF3E8672F72DD9400931CA8 /* DarkSword.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8CF3E8582F72D45800931CA8 /* DarkSword.framework */; };
 		8CF3E8682F72DD9400931CA8 /* DarkSword.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 8CF3E8582F72D45800931CA8 /* DarkSword.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		7EDFC40F2C64161BDECCADAB /* DOAppHide.m in Sources */ = {isa = PBXBuildFile; fileRef = 34B00B28CF032975724333D4 /* DOAppHide.m */; };
+		A7988F5944F2416655689F45 /* DOAppHideController.m in Sources */ = {isa = PBXBuildFile; fileRef = 0FC21EEDB31A040CE76DF81A /* DOAppHideController.m */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -697,6 +699,10 @@
 		8CF3E85B2F72D50200931CA8 /* DarkSword.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = DarkSword.m; sourceTree = "<group>"; };
 		8CF3E85E2F72D51200931CA8 /* DarkSword.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = DarkSword.h; sourceTree = "<group>"; };
 		C075B0CB2B8F2BCE009A26BB /* th */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = th; path = th.lproj/Localizable.strings; sourceTree = "<group>"; };
+		C9DC3E5336443FB2B9463A2F /* DOAppHide.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = DOAppHide.h; sourceTree = "<group>"; };
+		34B00B28CF032975724333D4 /* DOAppHide.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = DOAppHide.m; sourceTree = "<group>"; };
+		C5E9368846C7AE768F3E2289 /* DOAppHideController.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = DOAppHideController.h; sourceTree = "<group>"; };
+		0FC21EEDB31A040CE76DF81A /* DOAppHideController.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = DOAppHideController.m; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -881,6 +887,10 @@
 		042479692B66916B0082581B /* Settings */ = {
 			isa = PBXGroup;
 			children = (
+				C9DC3E5336443FB2B9463A2F /* DOAppHide.h */,
+				34B00B28CF032975724333D4 /* DOAppHide.m */,
+				C5E9368846C7AE768F3E2289 /* DOAppHideController.h */,
+				0FC21EEDB31A040CE76DF81A /* DOAppHideController.m */,
 				0443A9AE2B79D9A40014C933 /* PSLists */,
 				042479712B66916B0082581B /* Specifiers */,
 				0424796F2B66916B0082581B /* Credits.plist */,
@@ -2272,6 +2282,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				7EDFC40F2C64161BDECCADAB /* DOAppHide.m in Sources */,
+				A7988F5944F2416655689F45 /* DOAppHideController.m in Sources */,
 				8C609C9E2C19B4270023DD12 /* NSString+Version.m in Sources */,
 				042479A62B66916B0082581B /* DOHeaderCell.m in Sources */,
 				8C6599DD2C555A71000FF57F /* DOPSJetsamListItemsController.h in Sources */,

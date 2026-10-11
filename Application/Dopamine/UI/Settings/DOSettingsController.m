@@ -20,6 +20,7 @@
 #import "DOSceneDelegate.h"
 #import "DOPSJetsamListItemsController.h"
 #import "DOButtonCell.h"
+#import "DOAppHideController.h"
 
 @interface DOSettingsController ()
 
@@ -264,6 +265,23 @@
             [jetsamSpecifier setProperty:@"jetsamOptionNumbers" forKey:@"valuesDataSource"];
             [jetsamSpecifier setProperty:@"jetsamOptionTitles" forKey:@"titlesDataSource"];
             [specifiers addObject:jetsamSpecifier];
+
+            PSSpecifier *appHidingGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
+            appHidingGroupSpecifier.name = @"App Hiding";
+            [appHidingGroupSpecifier setProperty:@"Per-app jailbreak hiding. Rules are written to "
+                                                 @"/var/mobile/Library/Preferences/.DopamineAppHideRules.plist as root."
+                                          forKey:@"footerText"];
+            [specifiers addObject:appHidingGroupSpecifier];
+
+            PSSpecifier *appHidingSpecifier = [PSSpecifier preferenceSpecifierNamed:@"Hidden Apps"
+                                                                             target:self
+                                                                                set:defSetter
+                                                                                get:defGetter
+                                                                             detail:[DOAppHideController class]
+                                                                               cell:PSLinkCell
+                                                                               edit:nil];
+            [appHidingSpecifier setProperty:@YES forKey:@"enabled"];
+            [specifiers addObject:appHidingSpecifier];
             
             if (!envManager.isJailbroken && !envManager.isInstalledThroughTrollStore) {
                 PSSpecifier *removeJailbreakSwitchSpecifier = [PSSpecifier preferenceSpecifierNamed:DOLocalizedString(@"Button_Remove_Jailbreak") target:self set:@selector(setRemoveJailbreakEnabled:specifier:) get:defGetter detail:nil cell:PSSwitchCell edit:nil];
