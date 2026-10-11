@@ -1,4 +1,5 @@
 #include "common/common.h"
+#include "app_hide.h"
 
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_images.h>
@@ -505,5 +506,8 @@ __attribute__((constructor)) static void initializer(void)
 		// Feeable attempt at adding back CS_VALID
 		jbclient_cs_revalidate();
 #endif
+		// App Hide: launchdhook spawned us with DOPAMINE_APP_HIDE=1, so hide the
+		// jailbreak from this process (paths, image list, environment).
+		app_hide_install();
 	}
 }
