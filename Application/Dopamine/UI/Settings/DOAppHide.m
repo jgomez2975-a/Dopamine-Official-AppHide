@@ -25,11 +25,47 @@
     return APP_HIDE_RULES_PATH;
 }
 
+// The rules file lives outside the app container. A sandboxed read returns nil
+// even for a 0644 file, which makes every switch render as OFF when the panel is
+// re-entered, so the read has to happen in the same unsandbox scope the write
+// uses. One read per screen is enough; the cache is dropped on write and when
+// the panel appears.
+static NSDictionary *sAppHideRulesCache = nil;
+static NSError *sAppHideLastError = nil;
+
+- (void)appHideInvalidateRulesCache
+{
+    sAppHideRulesCache = nil;
+}
+
+- (NSDictionary<NSString *, NSDictionary *> *)appHideRulesFromDisk
+{
+    __block NSDictionary *rules = nil;
+    [self runUnsandboxed:^{
+        rules = [NSDictionary dictionaryWithContentsOfFile:APP_HIDE_RULES_PATH];
+    }];
+    NSDictionary *result = [rules isKindOfClass:[NSDictionary class]] ? rules : @{};
+    sAppHideRulesCache = result;
+    return result;
+}
+
 - (NSDictionary<NSString *, NSDictionary *> *)appHideRules
 {
-    NSDictionary *rules = [NSDictionary dictionaryWithContentsOfFile:self.appHideRulesPath];
-    if (![rules isKindOfClass:[NSDictionary class]]) return @{};
-    return rules;
+    if (sAppHideRulesCache) return sAppHideRulesCache;
+    return [self appHideRulesFromDisk];
+}
+
+// Shown in the panel footer: what is really on disk right now, plus the reason
+// the last write failed (errno text included) so a failure is never silent.
+- (NSString *)appHideDiagnostics
+{
+    NSDictionary *onDisk = [self appHideRulesFromDisk];
+    NSMutableString *out = [NSMutableString stringWithFormat:@"%@ — %lu entr%@ on disk",
+        APP_HIDE_RULES_PATH, (unsigned long)onDisk.count, onDisk.count == 1 ? @"y" : @"ies"];
+    if (sAppHideLastError) {
+        [out appendFormat:@"\nlast write failed: %@", sAppHideLastError.localizedDescription];
+    }
+    return out;
 }
 
 - (BOOL)writeAppHideRules:(NSDictionary<NSString *, NSDictionary *> *)rules error:(NSError **)error
@@ -87,6 +123,15 @@
         [self runUnsandboxed:work];
     }
 
+    if (ok) {
+        // keep the on-screen state identical to what landed on disk
+        sAppHideRulesCache = rules;
+        sAppHideLastError = nil;
+    }
+    else {
+        sAppHideLastError = writeError;
+        sAppHideRulesCache = nil;
+    }
     if (!ok && error) *error = writeError;
     return ok;
 }
@@ -105,9 +150,9 @@
     return [entry[@"HideNoInject"] boolValue];
 }
 
-- (void)setEnvironmentHidden:(BOOL)hidden forBundleID:(NSString *)bundleID
+- (BOOL)setEnvironmentHidden:(BOOL)hidden forBundleID:(NSString *)bundleID error:(NSError **)error
 {
-    if (!bundleID.length) return;
+    if (!bundleID.length) return YES;
 
     NSMutableDictionary *rules = [self.appHideRules mutableCopy] ?: [NSMutableDictionary new];
     NSMutableDictionary *entry = [rules[bundleID] mutableCopy];
@@ -122,15 +167,16 @@
         rules[bundleID] = entry;
     }
 
-    NSError *error = nil;
-    if (![self writeAppHideRules:rules error:&error]) {
-        NSLog(@"[AppHide] setEnvironmentHidden:%d for %@ failed: %@", hidden, bundleID, error);
+    BOOL ok = [self writeAppHideRules:rules error:error];
+    if (!ok) {
+        NSLog(@"[AppHide] setEnvironmentHidden:%d for %@ failed: %@", hidden, bundleID, error ? *error : nil);
     }
+    return ok;
 }
 
-- (void)setEnvironmentNoInject:(BOOL)noInject forBundleID:(NSString *)bundleID
+- (BOOL)setEnvironmentNoInject:(BOOL)noInject forBundleID:(NSString *)bundleID error:(NSError **)error
 {
-    if (!bundleID.length) return;
+    if (!bundleID.length) return YES;
 
     NSMutableDictionary *rules = [self.appHideRules mutableCopy] ?: [NSMutableDictionary new];
     NSMutableDictionary *entry = [rules[bundleID] mutableCopy] ?: [NSMutableDictionary new];
@@ -151,10 +197,11 @@
         [rules removeObjectForKey:bundleID];
     }
 
-    NSError *error = nil;
-    if (![self writeAppHideRules:rules error:&error]) {
-        NSLog(@"[AppHide] setEnvironmentNoInject:%d for %@ failed: %@", noInject, bundleID, error);
+    BOOL ok = [self writeAppHideRules:rules error:error];
+    if (!ok) {
+        NSLog(@"[AppHide] setEnvironmentNoInject:%d for %@ failed: %@", noInject, bundleID, error ? *error : nil);
     }
+    return ok;
 }
 
 #pragma clang diagnostic push
@@ -200,29 +247,34 @@
     }
 
     // Fallback (LaunchServices unavailable / restricted): scan the app container.
+    // /var/containers/Bundle/Application is outside this app's own container, so
+    // the scan (and each Info.plist read) is sandbox-denied until the label is
+    // dropped - an empty app list was the visible symptom.
     if (!apps.count) {
-        for (NSString *root in @[@"/var/containers/Bundle/Application", @"/private/var/containers/Bundle/Application"]) {
-            NSArray<NSString *> *uuids = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:root error:nil];
-            for (NSString *uuid in uuids) {
-                NSString *containerPath = [root stringByAppendingPathComponent:uuid];
-                NSArray<NSString *> *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:containerPath error:nil];
-                for (NSString *item in items) {
-                    if (![item hasSuffix:@".app"]) continue;
-                    NSString *appPath = [containerPath stringByAppendingPathComponent:item];
-                    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
-                        [appPath stringByAppendingPathComponent:@"Info.plist"]];
-                    NSString *bundleID = info[@"CFBundleIdentifier"];
-                    if (!bundleID.length || [seen containsObject:bundleID]) continue;
-                    [seen addObject:bundleID];
-                    [apps addObject:@{
-                        @"bundleID": bundleID,
-                        @"name": info[@"CFBundleDisplayName"] ?: info[@"CFBundleName"] ?: bundleID,
-                        @"path": appPath
-                    }];
+        [self runUnsandboxed:^{
+            for (NSString *root in @[@"/var/containers/Bundle/Application", @"/private/var/containers/Bundle/Application"]) {
+                NSArray<NSString *> *uuids = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:root error:nil];
+                for (NSString *uuid in uuids) {
+                    NSString *containerPath = [root stringByAppendingPathComponent:uuid];
+                    NSArray<NSString *> *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:containerPath error:nil];
+                    for (NSString *item in items) {
+                        if (![item hasSuffix:@".app"]) continue;
+                        NSString *appPath = [containerPath stringByAppendingPathComponent:item];
+                        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                            [appPath stringByAppendingPathComponent:@"Info.plist"]];
+                        NSString *bundleID = info[@"CFBundleIdentifier"];
+                        if (!bundleID.length || [seen containsObject:bundleID]) continue;
+                        [seen addObject:bundleID];
+                        [apps addObject:@{
+                            @"bundleID": bundleID,
+                            @"name": info[@"CFBundleDisplayName"] ?: info[@"CFBundleName"] ?: bundleID,
+                            @"path": appPath
+                        }];
+                    }
                 }
+                if (apps.count) break;
             }
-            if (apps.count) break;
-        }
+        }];
     }
 
     return [apps sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {

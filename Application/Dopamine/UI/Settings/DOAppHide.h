@@ -21,7 +21,16 @@ NS_ASSUME_NONNULL_BEGIN
 - (NSString *)appHideRulesPath;
 
 // Parsed rules: bundleID -> @{ @"HideEnvironment": @(BOOL), @"HideNoInject": @(BOOL) }
+// Both accessors read the file inside the same unsandbox scope the write uses;
+// a sandboxed read of /var/mobile/Library/Preferences returns nil, which would
+// make every switch render as OFF.
 - (NSDictionary<NSString *, NSDictionary *> *)appHideRules;
+- (NSDictionary<NSString *, NSDictionary *> *)appHideRulesFromDisk;
+- (void)appHideInvalidateRulesCache;
+
+// Human readable state for the panel footer: path, entry count on disk and the
+// reason the last write failed (if it did).
+- (NSString *)appHideDiagnostics;
 
 // Serialises and installs the rules file as root + unsandboxed, then reads it back
 // and compares. Sets *error (with the real errno) when the write is denied.
@@ -31,9 +40,10 @@ NS_ASSUME_NONNULL_BEGIN
 - (BOOL)isEnvironmentNoInjectForBundleID:(NSString *)bundleID;
 
 // Mirrors the basebin semantics: enabling NoInject also enables HideEnvironment;
-// disabling HideEnvironment removes the entry completely.
-- (void)setEnvironmentHidden:(BOOL)hidden forBundleID:(NSString *)bundleID;
-- (void)setEnvironmentNoInject:(BOOL)noInject forBundleID:(NSString *)bundleID;
+// disabling HideEnvironment removes the entry completely. Returns NO (and fills
+// *error) when the rules file could not be written.
+- (BOOL)setEnvironmentHidden:(BOOL)hidden forBundleID:(NSString *)bundleID error:(NSError **)error;
+- (BOOL)setEnvironmentNoInject:(BOOL)noInject forBundleID:(NSString *)bundleID error:(NSError **)error;
 
 // Installed user apps as @[ @{@"bundleID":.., @"name":.., @"path":..} ], sorted by name.
 - (NSArray<NSDictionary<NSString *, NSString *> *> *)appHideInstalledApps;
