@@ -1102,7 +1102,7 @@ static void app_hide_setup_objc(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v13"
+#define APP_HIDE_ENGINE_VERSION "v14"
 
 typedef struct {
 	const char *name;
@@ -1346,6 +1346,7 @@ static void app_hide_report_hooks(void)
 static const char kAppHideContainerIdFile[]     = ".DopamineAppHide.id";
 static const char kAppHideContainerHideFile[]   = ".DopamineAppHide.hide";
 static const char kAppHideContainerEngineFile[] = ".DopamineAppHide.engine";
+static const char kAppHideContainerSafeFile[]   = ".DopamineAppHide.safe";
 
 static bool app_hide_container_path(const char *file, char *out, size_t outSize)
 {
@@ -1362,6 +1363,25 @@ bool app_hide_container_marker_present(void)
 	if (!app_hide_container_path(kAppHideContainerHideFile, path, sizeof(path))) return false;
 	struct stat st = {};
 	return (stat(path, &st) == 0);
+}
+
+// The round 2 hook set is opt-in. It is the half that answers a banking SDK, and also the
+// half made of Darwin's bare syscall thunks - the ones litehook's fixed 20 byte patch
+// cannot rewrite without taking the next exported symbol with it. The first build that
+// reached a real app crashed it on launch, so the caller has to ask for it explicitly:
+// the panel writes "0" into the safe file for the apps where it is wanted.
+bool app_hide_container_enhanced_mode(void)
+{
+	char path[PATH_MAX];
+	if (!app_hide_container_path(kAppHideContainerSafeFile, path, sizeof(path))) return false;
+	int fd = open(path, O_RDONLY);
+	if (fd < 0) return false;
+	char buf[8] = {};
+	ssize_t n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0) return false;
+	buf[n] = '\0';
+	return (buf[0] == '0');
 }
 
 static void app_hide_container_write(const char *file, const char *content)
@@ -1408,9 +1428,10 @@ void app_hide_install(void)
 		char execPath[PATH_MAX];
 		uint32_t execPathSize = sizeof(execPath);
 		if (_NSGetExecutablePath(execPath, &execPathSize) == 0) {
-			char status[192];
-			snprintf(status, sizeof(status), "loaded  env=%d marker=%d hidden=%d\n",
-			         hiddenByEnv ? 1 : 0, hiddenByContainer ? 1 : 0, hidden ? 1 : 0);
+			char status[224];
+			snprintf(status, sizeof(status), "loaded  env=%d marker=%d hidden=%d enhanced=%d\n",
+			         hiddenByEnv ? 1 : 0, hiddenByContainer ? 1 : 0, hidden ? 1 : 0,
+			         app_hide_container_enhanced_mode() ? 1 : 0);
 			app_hide_register_container(execPath, status);
 		}
 	}
@@ -1419,11 +1440,13 @@ void app_hide_install(void)
 
 	app_hide_note("activate", hiddenByContainer ? "container marker" : "environment marker");
 
-	// v7: round 2 is ON by default - it is the part that actually answers a banking
-	// SDK (fork / sysctl / statfs / getattrlist / the LaunchServices app list), and the
-	// device report is that v4 hid nothing without it. _JBEnvMode=0 still turns it off,
-	// so the aggressive half can be bisected without a rebuild.
-	bool aggressive = !(marker && strcmp(marker, "0") == 0);
+	// v14: round 2 is opt-in per app. Device evidence: the build that first reached a
+	// bank app killed it on launch, and the aggressive half is exactly the set of
+	// functions Darwin exports as bare syscall thunks. Default is therefore path hiding
+	// only; the panel's per-app switch writes "0" into this app's safe file to turn the
+	// extended set on, so the crash can be bisected on the device without a rebuild.
+	bool aggressive = app_hide_container_enhanced_mode();
+	if (marker && strcmp(marker, "0") == 0) aggressive = false;   // daemon side override
 
 	if (JB_RootPath && JB_RootPath[0] == '/') {
 		size_t len = strlen(JB_RootPath);

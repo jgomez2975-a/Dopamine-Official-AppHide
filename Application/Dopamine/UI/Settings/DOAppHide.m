@@ -198,7 +198,7 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
         // that carries the short-hook path and the xpcproxy-aware rules lookup, so a
         // clean systemhook cannot fake them.
         NSArray<NSString *> *markers = @[@"app_hide_install", @"canOpenURL",
-                                        @".DopamineAppHideRules.plist", @"engine v13",
+                                        @".DopamineAppHideRules.plist", @"engine v14",
                                         @"8 byte thunk hook",
                                         @".DopamineAppHide.spawn.log",
                                         @"hide=%d noinject=%d",
@@ -266,10 +266,17 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
                     [caches stringByAppendingPathComponent:kAppHideContainerEngineFile]];
                 BOOL marked = caches && [rfm2 fileExistsAtPath:
                     [caches stringByAppendingPathComponent:kAppHideContainerHideFile]];
-                [containerLines addObject:[NSString stringWithFormat:@"  %@  容器%@ / 引擎%@ / 标记%@", key,
+                NSString *engineState = caches ? [NSString stringWithContentsOfFile:
+                    [caches stringByAppendingPathComponent:kAppHideContainerEngineFile]
+                    encoding:NSUTF8StringEncoding error:nil] : nil;
+                engineState = [engineState stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                [containerLines addObject:[NSString stringWithFormat:@"  %@  容器%@ / 引擎%@ / 标记%@\n      %@",
+                    key,
                     container.length ? @"✅" : @"❌",
                     engineLoaded ? @"✅" : @"❌引擎没进这个App",
-                    marked ? @"✅" : @"❌"]];
+                    marked ? @"✅" : @"❌",
+                    engineState.length ? engineState : @"引擎还没在这个 App 里跑过"]];
             }
             [lines addObject:[NSString stringWithFormat:@"容器 / 引擎 / 标记：\n%@",
                               [containerLines componentsJoinedByString:@"\n"]]];
@@ -323,6 +330,7 @@ static NSString *const kAppHideLogDir  = @"AppHideLogs";
 static NSString *const kAppHideContainerIdFile   = @".DopamineAppHide.id";
 static NSString *const kAppHideContainerHideFile = @".DopamineAppHide.hide";
 static NSString *const kAppHideContainerEngineFile = @".DopamineAppHide.engine";
+static NSString *const kAppHideContainerSafeFile = @".DopamineAppHide.safe";
 static NSString *const kAppHideLogName = @".DopamineAppHide.log";
 static NSString *const kAppHideCrashDir = @"CrashReports";
 static const NSUInteger kAppHideLogKeep = 40;
@@ -686,6 +694,31 @@ static const NSUInteger kAppHideCrashKeep = 12;
     if (!ok) {
         NSLog(@"[AppHide] setEnvironmentNoInject:%d for %@ failed: %@", noInject, bundleID, error ? *error : nil);
     }
+    // v20: this switch is the round 2 hook set. It has to reach the engine inside the app,
+    // and the app's own container is the only channel that gets there.
+    [self setEnhancedMode:noInject forBundleID:bundleID];
+    return ok;
+}
+
+// "0" = round 2 hooks on, "1" = path hiding only (the default when the file is absent).
+- (BOOL)setEnhancedMode:(BOOL)enhanced forBundleID:(NSString *)bundleID
+{
+    NSString *marker = [self appHideContainerMarkerForBundleID:bundleID];
+    if (!marker.length) return NO;
+    NSString *path = [[marker stringByDeletingLastPathComponent]
+        stringByAppendingPathComponent:kAppHideContainerSafeFile];
+
+    __block BOOL ok = NO;
+    [self appHideRunEscaped:^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [@(enhanced ? @"0" : @"1") writeToFile:path atomically:YES
+                encoding:NSUTF8StringEncoding error:nil];
+        if ([fm fileExistsAtPath:path]) {
+            chown(path.fileSystemRepresentation, APP_HIDE_RULES_OWNER, APP_HIDE_RULES_GROUP);
+            chmod(path.fileSystemRepresentation, 0644);
+        }
+        ok = [fm fileExistsAtPath:path];
+    }];
     return ok;
 }
 
