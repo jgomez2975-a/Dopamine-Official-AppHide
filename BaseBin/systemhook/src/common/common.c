@@ -347,13 +347,12 @@ static int spawn_exec_hook_common(bool isExec,
 			shouldInsertJBEnv = false;
 			break;
 		}
-		if (shouldHideAppEnv && appHideNoInject) {
-			// App Hide / NoInject: this app gets no dylib at all, instead of going through
-			// the "remove the hook dylib" path below (that path would still normalise the
-			// jailbreak environment variables in a way that leaves traces of the env).
-			shouldInsertJBEnv = false;
-			break;
-		}
+		// App Hide: hiding comes first. An earlier revision treated NoInject as "inject
+		// nothing at all", which also skipped the engine that performs the hiding - the app
+		// then looked completely stock and passed every jailbreak check. NoInject now only
+		// means "no tweaks": systemhook is still injected and stays invisible via
+		// _JBEnvMode, so hiding and NoInject can be used together.
+		(void)appHideNoInject;
 
 
 		// Check if we can find a _SafeMode or _MSSafeMode variable

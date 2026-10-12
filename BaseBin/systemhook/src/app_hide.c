@@ -1102,7 +1102,7 @@ static void app_hide_setup_objc(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v12"
+#define APP_HIDE_ENGINE_VERSION "v13"
 
 typedef struct {
 	const char *name;
@@ -1343,8 +1343,9 @@ static void app_hide_report_hooks(void)
 // two files inside the app's own container:
 //   Library/Caches/.DopamineAppHide.id    written by the engine, holds its executable path
 //   Library/Caches/.DopamineAppHide.hide  written by the panel, means "hide this app"
-static const char kAppHideContainerIdFile[]   = ".DopamineAppHide.id";
-static const char kAppHideContainerHideFile[] = ".DopamineAppHide.hide";
+static const char kAppHideContainerIdFile[]     = ".DopamineAppHide.id";
+static const char kAppHideContainerHideFile[]   = ".DopamineAppHide.hide";
+static const char kAppHideContainerEngineFile[] = ".DopamineAppHide.engine";
 
 static bool app_hide_container_path(const char *file, char *out, size_t outSize)
 {
@@ -1363,43 +1364,58 @@ bool app_hide_container_marker_present(void)
 	return (stat(path, &st) == 0);
 }
 
-// Runs on every app launch, before any decision is made, so that the panel can tie a container
-// to a bundle path. Only writes when the file is missing, so the cost is one failed stat.
-static void app_hide_register_container(const char *execPath)
+static void app_hide_container_write(const char *file, const char *content)
+{
+	char path[PATH_MAX];
+	if (!app_hide_container_path(file, path, sizeof(path))) return;
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) return;
+	(void)write(fd, content, strlen(content));
+	close(fd);
+}
+
+// The id file is written once and ties a container to a bundle path; the engine file is
+// rewritten on every launch and is what proves to the panel that this app's engine loaded
+// at all - the difference between "no engine" and "engine but no marker" cost a round.
+// Runs even when the process is not hidden.
+static void app_hide_register_container(const char *execPath, const char *status)
 {
 	if (!execPath || !execPath[0]) return;
 
 	char path[PATH_MAX];
-	if (!app_hide_container_path(kAppHideContainerIdFile, path, sizeof(path))) return;
-
-	struct stat st = {};
-	if (stat(path, &st) == 0) return;
-
-	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	if (fd < 0) return;
-	(void)write(fd, execPath, strlen(execPath));
-	close(fd);
+	if (app_hide_container_path(kAppHideContainerIdFile, path, sizeof(path))) {
+		struct stat st = {};
+		if (stat(path, &st) != 0) app_hide_container_write(kAppHideContainerIdFile, execPath);
+	}
+	app_hide_container_write(kAppHideContainerEngineFile, status);
 }
 
 void app_hide_install(void)
 {
 	if (gAppHideActive) return;
 
-	// Register this container first, so a launch that is NOT hidden still teaches the
-	// panel where this app's container is.
-	{
-		char execPath[PATH_MAX];
-		uint32_t execPathSize = sizeof(execPath);
-		if (_NSGetExecutablePath(execPath, &execPathSize) == 0) app_hide_register_container(execPath);
-	}
-
-	// Two ways in: the environment marker (works for daemons launchd spawns) and the
-	// container marker (what actually reaches a home screen launch).
+	// Two ways in: the environment marker (set by launchdhook's spawn hook) and the
+	// container marker (written by the panel; the one thing a sandboxed app can read).
 	const char *marker = getenv(APP_HIDE_ENV_MARKER);
 	if (!marker) marker = getenv("DOPAMINE_APP_HIDE");   // older basebin
 	bool hiddenByEnv = (marker && strcmp(marker, "1") == 0);
 	bool hiddenByContainer = app_hide_container_marker_present();
-	if (!hiddenByEnv && !hiddenByContainer) return;
+	bool hidden = (hiddenByEnv || hiddenByContainer);
+
+	// Tell the panel what happened here, hidden or not: this file is the only proof that
+	// the engine loaded inside this app.
+	{
+		char execPath[PATH_MAX];
+		uint32_t execPathSize = sizeof(execPath);
+		if (_NSGetExecutablePath(execPath, &execPathSize) == 0) {
+			char status[192];
+			snprintf(status, sizeof(status), "loaded  env=%d marker=%d hidden=%d\n",
+			         hiddenByEnv ? 1 : 0, hiddenByContainer ? 1 : 0, hidden ? 1 : 0);
+			app_hide_register_container(execPath, status);
+		}
+	}
+
+	if (!hidden) return;
 
 	app_hide_note("activate", hiddenByContainer ? "container marker" : "environment marker");
 

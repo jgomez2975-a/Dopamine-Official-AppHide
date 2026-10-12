@@ -198,7 +198,7 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
         // that carries the short-hook path and the xpcproxy-aware rules lookup, so a
         // clean systemhook cannot fake them.
         NSArray<NSString *> *markers = @[@"app_hide_install", @"canOpenURL",
-                                        @".DopamineAppHideRules.plist", @"engine v12",
+                                        @".DopamineAppHideRules.plist", @"engine v13",
                                         @"8 byte thunk hook",
                                         @".DopamineAppHide.spawn.log",
                                         @"hide=%d noinject=%d",
@@ -258,12 +258,20 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
         if (rules.count) {
             NSMutableArray<NSString *> *containerLines = [NSMutableArray new];
             NSDictionary<NSString *, NSString *> *paths = [self appHideInstalledAppsByBundleID];
+            NSFileManager *rfm2 = [NSFileManager defaultManager];
             for (NSString *key in [rules.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
-                NSString *marker = [self appHideFindContainerMarkerLocked:paths[key]];
-                [containerLines addObject:[NSString stringWithFormat:@"  %@  %@", key,
-                    marker.length ? @"容器标记 ✅" : @"容器标记 ❌（先启动一次该 App 再开开关）"]];
+                NSString *container = [self appHideContainerPathLocked:key appPath:paths[key]];
+                NSString *caches = container.length ? [container stringByAppendingPathComponent:@"Library/Caches"] : nil;
+                BOOL engineLoaded = caches && [rfm2 fileExistsAtPath:
+                    [caches stringByAppendingPathComponent:kAppHideContainerEngineFile]];
+                BOOL marked = caches && [rfm2 fileExistsAtPath:
+                    [caches stringByAppendingPathComponent:kAppHideContainerHideFile]];
+                [containerLines addObject:[NSString stringWithFormat:@"  %@  容器%@ / 引擎%@ / 标记%@", key,
+                    container.length ? @"✅" : @"❌",
+                    engineLoaded ? @"✅" : @"❌引擎没进这个App",
+                    marked ? @"✅" : @"❌"]];
             }
-            [lines addObject:[NSString stringWithFormat:@"容器标记：\n%@",
+            [lines addObject:[NSString stringWithFormat:@"容器 / 引擎 / 标记：\n%@",
                               [containerLines componentsJoinedByString:@"\n"]]];
         }
 
@@ -314,6 +322,7 @@ static NSString *const kAppHideLogDir  = @"AppHideLogs";
 // sandboxed app is guaranteed to be able to read.
 static NSString *const kAppHideContainerIdFile   = @".DopamineAppHide.id";
 static NSString *const kAppHideContainerHideFile = @".DopamineAppHide.hide";
+static NSString *const kAppHideContainerEngineFile = @".DopamineAppHide.engine";
 static NSString *const kAppHideLogName = @".DopamineAppHide.log";
 static NSString *const kAppHideCrashDir = @"CrashReports";
 static const NSUInteger kAppHideLogKeep = 40;
@@ -321,24 +330,48 @@ static const NSUInteger kAppHideCrashKeep = 12;
 
 // Assumes the caller is already root + unsandboxed: scanning every container is the
 // mechanism appHideCollectLogs already uses.
-- (NSString *)appHideFindContainerMarkerLocked:(NSString *)appPath
+//
+// The primary source is the metadata every data container carries,
+// MCMMetadataIdentifier being the bundle id - that works before the engine has ever run
+// inside the app. The engine's own .id file is only a fallback for containers whose
+// metadata cannot be read.
+- (NSString *)appHideContainerPathLocked:(NSString *)bundleID appPath:(NSString *)appPath
 {
-    if (!appPath.length) return nil;
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *root = @"/var/mobile/Containers/Data/Application";
-    for (NSString *uuid in [fm contentsOfDirectoryAtPath:root error:nil]) {
-        NSString *caches = [[root stringByAppendingPathComponent:uuid]
-            stringByAppendingPathComponent:@"Library/Caches"];
-        NSString *idPath = [caches stringByAppendingPathComponent:kAppHideContainerIdFile];
+    NSArray *uuids = [fm contentsOfDirectoryAtPath:root error:nil];
+
+    if (bundleID.length) {
+        for (NSString *uuid in uuids) {
+            NSString *container = [root stringByAppendingPathComponent:uuid];
+            NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+                [container stringByAppendingPathComponent:
+                    @".com.apple.mobile_container_manager.metadata.plist"]];
+            if ([info[@"MCMMetadataIdentifier"] isEqualToString:bundleID]) return container;
+        }
+    }
+    if (!appPath.length) return nil;
+    for (NSString *uuid in uuids) {
+        NSString *container = [root stringByAppendingPathComponent:uuid];
+        NSString *idPath = [[container stringByAppendingPathComponent:@"Library/Caches"]
+            stringByAppendingPathComponent:kAppHideContainerIdFile];
         NSString *content = [NSString stringWithContentsOfFile:idPath
                                                       encoding:NSUTF8StringEncoding error:nil];
         if (!content.length) continue;
         content = [content stringByTrimmingCharactersInSet:
                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (![content hasPrefix:appPath]) continue;
-        return [caches stringByAppendingPathComponent:kAppHideContainerHideFile];
+        if ([content hasPrefix:appPath]) return container;
     }
     return nil;
+}
+
+- (NSString *)appHideFindContainerMarkerLocked:(NSString *)bundleID
+{
+    NSString *container = [self appHideContainerPathLocked:bundleID
+        appPath:[self appHideInstalledAppsByBundleID][bundleID]];
+    if (!container.length) return nil;
+    return [[container stringByAppendingPathComponent:@"Library/Caches"]
+        stringByAppendingPathComponent:kAppHideContainerHideFile];
 }
 
 - (NSDictionary<NSString *, NSString *> *)appHideInstalledAppsByBundleID
@@ -352,15 +385,10 @@ static const NSUInteger kAppHideCrashKeep = 12;
 
 - (NSString *)appHideContainerMarkerForBundleID:(NSString *)bundleID
 {
-    NSString *appPath = nil;
-    for (NSDictionary *candidate in [self appHideInstalledApps]) {
-        if ([candidate[@"bundleID"] isEqualToString:bundleID]) { appPath = candidate[@"path"]; break; }
-    }
-    if (!appPath.length) return nil;
-
+    if (!bundleID.length) return nil;
     __block NSString *marker = nil;
     [self appHideRunEscaped:^{
-        marker = [self appHideFindContainerMarkerLocked:appPath];
+        marker = [self appHideFindContainerMarkerLocked:bundleID];
     }];
     return marker;
 }
