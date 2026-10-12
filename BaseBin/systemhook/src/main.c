@@ -208,6 +208,12 @@ bool should_enable_tweaks(void)
 			return false;
 		}
 	}
+	if (app_hide_container_marker_present()) {
+		// App Hide: the panel marked this app's container, so the jailbreak has to stay
+		// invisible here - no tweak may be loaded into this process either.
+		return false;
+	}
+
 	char *appHideEnv = getenv("_JBEnvMode");
 	if (!appHideEnv) appHideEnv = getenv("DOPAMINE_APP_HIDE");	// older basebin
 	if (appHideEnv && !strcmp(appHideEnv, "1")) {

@@ -253,6 +253,20 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
             [lines addObject:@"规则文件：读不到或为空（开关没写进 .DopamineAppHideRules.plist）"];
         }
 
+        // Container markers: the half that decides a home screen launch, and the half that
+        // cannot be checked from the sandbox.
+        if (rules.count) {
+            NSMutableArray<NSString *> *containerLines = [NSMutableArray new];
+            NSDictionary<NSString *, NSString *> *paths = [self appHideInstalledAppsByBundleID];
+            for (NSString *key in [rules.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+                NSString *marker = [self appHideFindContainerMarkerLocked:paths[key]];
+                [containerLines addObject:[NSString stringWithFormat:@"  %@  %@", key,
+                    marker.length ? @"容器标记 ✅" : @"容器标记 ❌（先启动一次该 App 再开开关）"]];
+            }
+            [lines addObject:[NSString stringWithFormat:@"容器标记：\n%@",
+                              [containerLines componentsJoinedByString:@"\n"]]];
+        }
+
         NSString *spawnLogPath = @"/var/mobile/Library/Preferences/.DopamineAppHide.spawn.log";
         NSData *spawnData = [NSData dataWithContentsOfFile:spawnLogPath];
         if (spawnData.length) {
@@ -295,10 +309,99 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
 }
 
 static NSString *const kAppHideLogDir  = @"AppHideLogs";
+// Container files: the engine writes the .id one (its own executable path) and the panel
+// writes the .hide one. Both live in the app's own container, which is the only place a
+// sandboxed app is guaranteed to be able to read.
+static NSString *const kAppHideContainerIdFile   = @".DopamineAppHide.id";
+static NSString *const kAppHideContainerHideFile = @".DopamineAppHide.hide";
 static NSString *const kAppHideLogName = @".DopamineAppHide.log";
 static NSString *const kAppHideCrashDir = @"CrashReports";
 static const NSUInteger kAppHideLogKeep = 40;
 static const NSUInteger kAppHideCrashKeep = 12;
+
+// Assumes the caller is already root + unsandboxed: scanning every container is the
+// mechanism appHideCollectLogs already uses.
+- (NSString *)appHideFindContainerMarkerLocked:(NSString *)appPath
+{
+    if (!appPath.length) return nil;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *root = @"/var/mobile/Containers/Data/Application";
+    for (NSString *uuid in [fm contentsOfDirectoryAtPath:root error:nil]) {
+        NSString *caches = [[root stringByAppendingPathComponent:uuid]
+            stringByAppendingPathComponent:@"Library/Caches"];
+        NSString *idPath = [caches stringByAppendingPathComponent:kAppHideContainerIdFile];
+        NSString *content = [NSString stringWithContentsOfFile:idPath
+                                                      encoding:NSUTF8StringEncoding error:nil];
+        if (!content.length) continue;
+        content = [content stringByTrimmingCharactersInSet:
+                      [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (![content hasPrefix:appPath]) continue;
+        return [caches stringByAppendingPathComponent:kAppHideContainerHideFile];
+    }
+    return nil;
+}
+
+- (NSDictionary<NSString *, NSString *> *)appHideInstalledAppsByBundleID
+{
+    NSMutableDictionary<NSString *, NSString *> *map = [NSMutableDictionary new];
+    for (NSDictionary *app in [self appHideInstalledApps]) {
+        if (app[@"bundleID"] && app[@"path"]) map[app[@"bundleID"]] = app[@"path"];
+    }
+    return map;
+}
+
+- (NSString *)appHideContainerMarkerForBundleID:(NSString *)bundleID
+{
+    NSString *appPath = nil;
+    for (NSDictionary *candidate in [self appHideInstalledApps]) {
+        if ([candidate[@"bundleID"] isEqualToString:bundleID]) { appPath = candidate[@"path"]; break; }
+    }
+    if (!appPath.length) return nil;
+
+    __block NSString *marker = nil;
+    [self appHideRunEscaped:^{
+        marker = [self appHideFindContainerMarkerLocked:appPath];
+    }];
+    return marker;
+}
+
+// This is the half that actually reaches a home screen launch: the rules file is read by
+// launchd's spawn path, which never sees one.
+- (BOOL)setContainerMarker:(BOOL)hidden forBundleID:(NSString *)bundleID error:(NSError **)error
+{
+    NSString *markerPath = [self appHideContainerMarkerForBundleID:bundleID];
+    if (!markerPath) {
+        if (!hidden) return YES;
+        if (error) {
+            *error = [NSError errorWithDomain:@"AppHide" code:7 userInfo:@{NSLocalizedDescriptionKey:
+                @"找不到这个 App 的数据容器。\n\n"
+                 "引擎第一次在这个 App 里加载时，会在它自己的容器写下身份文件，面板才能把标记放对地方。\n"
+                 "请先把这个 App 启动一次（跑一次就行，其它都不用做），再回来打开开关。"}];
+        }
+        return NO;
+    }
+
+    __block BOOL ok = YES;
+    [self appHideRunEscaped:^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (hidden) {
+            if (![fm fileExistsAtPath:markerPath]) {
+                [@"1" writeToFile:markerPath atomically:YES
+                        encoding:NSUTF8StringEncoding error:nil];
+            }
+            if ([fm fileExistsAtPath:markerPath]) {
+                chown(markerPath.fileSystemRepresentation, APP_HIDE_RULES_OWNER, APP_HIDE_RULES_GROUP);
+                chmod(markerPath.fileSystemRepresentation, 0644);
+            }
+            ok = [fm fileExistsAtPath:markerPath];
+        }
+        else {
+            [fm removeItemAtPath:markerPath error:nil];
+            ok = ![fm fileExistsAtPath:markerPath];
+        }
+    }];
+    return ok;
+}
 
 - (NSString *)appHideCollectLogs
 {
@@ -516,6 +619,14 @@ static const NSUInteger kAppHideCrashKeep = 12;
     BOOL ok = [self writeAppHideRules:rules error:error];
     if (!ok) {
         NSLog(@"[AppHide] setEnvironmentHidden:%d for %@ failed: %@", hidden, bundleID, error ? *error : nil);
+    }
+    // The rules file alone is not enough: it is consulted on the launchd spawn path, which
+    // a home screen launch does not use. The container marker is what the app process
+    // itself can see.
+    NSError *markerError = nil;
+    if (![self setContainerMarker:hidden forBundleID:bundleID error:&markerError]) {
+        if (error) *error = markerError;
+        return NO;
     }
     return ok;
 }

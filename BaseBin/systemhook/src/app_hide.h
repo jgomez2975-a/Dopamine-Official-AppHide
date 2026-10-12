@@ -20,4 +20,9 @@
 // accesses, so check-in, tweak loading and cs revalidation have to be done.
 void app_hide_install(void);
 
+// The per-app flag the panel writes into the app's own container. Consulted by
+// app_hide_install() and by should_enable_tweaks(), because a hidden app must not get
+// tweaks loaded into it either.
+bool app_hide_container_marker_present(void);
+
 #endif

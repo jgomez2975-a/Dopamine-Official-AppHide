@@ -1102,7 +1102,7 @@ static void app_hide_setup_objc(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v11"
+#define APP_HIDE_ENGINE_VERSION "v12"
 
 typedef struct {
 	const char *name;
@@ -1329,13 +1329,79 @@ static void app_hide_report_hooks(void)
 
 #pragma mark - install
 
+
+#pragma mark - per-container marker
+
+// The environment marker cannot be relied on for apps. A home screen launch is performed by
+// runningboardd, not by launchd (where launchdhook sets _JBEnvMode), and the environment
+// runningboardd hands an app is built from its own configuration, so the marker either never
+// gets set or does not survive the launch. Device evidence: the spawn log held daemon xpcproxy
+// lines only, and every hidden app stayed completely unhooked.
+//
+// A sandboxed app can always read its own container, and the panel can write there as root
+// (it already does, for the rules file and the log collection). So the decision is carried by
+// two files inside the app's own container:
+//   Library/Caches/.DopamineAppHide.id    written by the engine, holds its executable path
+//   Library/Caches/.DopamineAppHide.hide  written by the panel, means "hide this app"
+static const char kAppHideContainerIdFile[]   = ".DopamineAppHide.id";
+static const char kAppHideContainerHideFile[] = ".DopamineAppHide.hide";
+
+static bool app_hide_container_path(const char *file, char *out, size_t outSize)
+{
+	if (out && outSize) out[0] = '\0';
+	const char *home = getenv("HOME");
+	if (!home || home[0] != '/') return false;
+	snprintf(out, outSize, "%s/Library/Caches/%s", home, file);
+	return true;
+}
+
+bool app_hide_container_marker_present(void)
+{
+	char path[PATH_MAX];
+	if (!app_hide_container_path(kAppHideContainerHideFile, path, sizeof(path))) return false;
+	struct stat st = {};
+	return (stat(path, &st) == 0);
+}
+
+// Runs on every app launch, before any decision is made, so that the panel can tie a container
+// to a bundle path. Only writes when the file is missing, so the cost is one failed stat.
+static void app_hide_register_container(const char *execPath)
+{
+	if (!execPath || !execPath[0]) return;
+
+	char path[PATH_MAX];
+	if (!app_hide_container_path(kAppHideContainerIdFile, path, sizeof(path))) return;
+
+	struct stat st = {};
+	if (stat(path, &st) == 0) return;
+
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) return;
+	(void)write(fd, execPath, strlen(execPath));
+	close(fd);
+}
+
 void app_hide_install(void)
 {
 	if (gAppHideActive) return;
 
+	// Register this container first, so a launch that is NOT hidden still teaches the
+	// panel where this app's container is.
+	{
+		char execPath[PATH_MAX];
+		uint32_t execPathSize = sizeof(execPath);
+		if (_NSGetExecutablePath(execPath, &execPathSize) == 0) app_hide_register_container(execPath);
+	}
+
+	// Two ways in: the environment marker (works for daemons launchd spawns) and the
+	// container marker (what actually reaches a home screen launch).
 	const char *marker = getenv(APP_HIDE_ENV_MARKER);
 	if (!marker) marker = getenv("DOPAMINE_APP_HIDE");   // older basebin
-	if (!marker || strcmp(marker, "1") != 0) return;
+	bool hiddenByEnv = (marker && strcmp(marker, "1") == 0);
+	bool hiddenByContainer = app_hide_container_marker_present();
+	if (!hiddenByEnv && !hiddenByContainer) return;
+
+	app_hide_note("activate", hiddenByContainer ? "container marker" : "environment marker");
 
 	// v7: round 2 is ON by default - it is the part that actually answers a banking
 	// SDK (fork / sysctl / statfs / getattrlist / the LaunchServices app list), and the
