@@ -843,8 +843,7 @@ typedef struct {
 
 static app_hide_hook_result gAppHideHooks[APP_HIDE_HOOK_MAX];
 static size_t gAppHideHookCount = 0;
-static size_t gHookedCount = 0;
-static size_t gSkippedCount = 0;
+static size_t gSkippedCount = 0;   // gHookedCount is declared with the other globals
 
 #ifdef __arm64__
 static bool app_hide_insn_leaves_flow(uint32_t insn)
