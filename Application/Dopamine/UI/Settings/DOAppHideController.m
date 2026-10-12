@@ -5,13 +5,16 @@
 
 #import "DOAppHideController.h"
 #import "DOAppHide.h"
+// Upstream Dopamine renders every button in this app with DOButtonCell; a bare
+// PSButtonCell does not dispatch the specifier action on this OS version.
+#import "DOButtonCell.h"
 #import "DOEnvironmentManager.h"
 #import <UIKit/UIKit.h>
 
 // Version of the panel code itself, shown in the first row. The engine inside the
 // basebin has its own version (it logs "engine vN"), and keeping them visible together
 // is how "the app updated but the basebin did not" stops being invisible.
-#define APP_HIDE_PANEL_VERSION @"v10"
+#define APP_HIDE_PANEL_VERSION @"v11"
 
 // Name matching for the search field. Substring first, then subsequence, so the
 // short forms people actually type still find the app: "农行" -> 中国农业银行
@@ -177,9 +180,14 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     // Rows that depend on nothing else go in first: even if the app list below fails, the
     // panel still shows a title, the self check and the export row.
     NSString *verdict = @"未知";
+    NSString *checkText = @"（自检未执行）";
     @try {
         verdict = [envManager appHideBasebinVerdict];
+        // Full detail is rendered into a group footer below, so the answer does not sit
+        // behind a button that can fail.
+        checkText = [envManager appHideEnvironmentSelfCheck];
     } @catch (NSException *e) {
+        checkText = [NSString stringWithFormat:@"自检失败：%@", e.reason ?: @"未知异常"];
         DOAppHideTrace([@"self check failed: " stringByAppendingString:e.reason ?: @"?"]);
     }
 
@@ -194,6 +202,10 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     // Environment self check as its own row: tap to see which basebin is really
     // installed. Shown before anything else because if the installed basebin is the
     // stock one, every switch below writes a rules file that nothing reads.
+    //
+    // The cellClass property is not optional: upstream wires every button in this app as
+    // a DOButtonCell, and a bare PSButtonCell does not dispatch the `action` property on
+    // this OS version - tapping it does nothing at all, which is exactly what happened.
     PSSpecifier *checkSpecifier = [PSSpecifier preferenceSpecifierNamed:@"环境自检（点开看 basebin 详情）"
                                                                  target:self
                                                                     set:nil
@@ -202,8 +214,17 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
                                                                    cell:PSButtonCell
                                                                    edit:nil];
     [checkSpecifier setProperty:@YES forKey:@"enabled"];
-    [checkSpecifier setProperty:NSStringFromSelector(@selector(appHideEnvironmentCheck)) forKey:@"action"];
+    [checkSpecifier setProperty:[DOButtonCell class] forKey:@"cellClass"];
+    [checkSpecifier setProperty:@"appHideEnvironmentCheck" forKey:@"action"];
+    checkSpecifier.buttonAction = NSSelectorFromString(@"appHideEnvironmentCheck");
     [specifiers addObject:checkSpecifier];
+
+    // The same text as a group footer, so the answer is on screen without any tap: two
+    // broken buttons in a row is what this costs when a diagnostic hides behind one.
+    PSSpecifier *checkGroup = [PSSpecifier emptyGroupSpecifier];
+    checkGroup.name = @"环境自检详情";
+    [checkGroup setProperty:checkText forKey:@"footerText"];
+    [specifiers addObject:checkGroup];
 
     // Log / crash-report export on demand. The copy walks every app container as root
     // and is the slowest thing in this screen, so it is a row the user taps instead of
@@ -216,8 +237,19 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
                                                                     cell:PSButtonCell
                                                                     edit:nil];
     [exportSpecifier setProperty:@YES forKey:@"enabled"];
-    [exportSpecifier setProperty:NSStringFromSelector(@selector(appHideExportLogs)) forKey:@"action"];
+    [exportSpecifier setProperty:[DOButtonCell class] forKey:@"cellClass"];
+    [exportSpecifier setProperty:@"appHideExportLogs" forKey:@"action"];
+    exportSpecifier.buttonAction = NSSelectorFromString(@"appHideExportLogs");
     [specifiers addObject:exportSpecifier];
+
+    // Where the logs live, so the file route works even if every button misbehaves.
+    PSSpecifier *logPathGroup = [PSSpecifier emptyGroupSpecifier];
+    logPathGroup.name = @"日志位置";
+    [logPathGroup setProperty:[NSString stringWithFormat:
+                                   @"%@\n在「文件」App → 我的 iPhone → Dopamine → AppHideLogs 里可以直接看到",
+                               [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/AppHideLogs"]]
+                       forKey:@"footerText"];
+    [specifiers addObject:logPathGroup];
 
     // The app list is the one part that depends on the jailbreak being up (it escalates to
     // root and reads the container layout). It is isolated: on failure the panel keeps the
