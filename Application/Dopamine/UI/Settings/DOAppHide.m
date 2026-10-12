@@ -198,7 +198,7 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
         // that carries the short-hook path and the xpcproxy-aware rules lookup, so a
         // clean systemhook cannot fake them.
         NSArray<NSString *> *markers = @[@"app_hide_install", @"canOpenURL",
-                                        @".DopamineAppHideRules.plist", @"engine v17",
+                                        @".DopamineAppHideRules.plist", @"engine v18",
                                         @"8 byte thunk hook",
                                         @".DopamineAppHide.spawn.log",
                                         @"hide=%d noinject=%d",

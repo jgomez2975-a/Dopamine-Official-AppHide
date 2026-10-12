@@ -1143,6 +1143,16 @@ static void app_hide_image_added(const struct mach_header *header, intptr_t slid
 // execution well past dyld init. Cheap once done: one bool test per call.
 static void app_hide_tick(void)
 {
+	// v18: this used to run in every process that had the engine loaded. That was harmless while
+	// only open/fopen were hooked (a hidden app, an explicit call), but the interpose section
+	// routes every stat/fstatat/statfs/getattrlist on the device through here - including in
+	// system daemons. The tick's payload is not inert: it installs the LaunchServices swizzle and
+	// can run the deferred dyld work. On the device that showed up as assetsd and misagent
+	// aborting in a loop right after the install (their crash reports appear only in that window
+	// and nowhere in the 175 reports before it). A process that is not being hidden must not run
+	// any of it, so the guard comes first.
+	if (!gAppHideActive) return;
+
 	static bool booted = false;
 	if (!booted) {
 		booted = true;
@@ -1245,7 +1255,7 @@ static void app_hide_register_image_callback(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v17"
+#define APP_HIDE_ENGINE_VERSION "v18"
 
 typedef struct {
 	const char *name;
@@ -1635,9 +1645,12 @@ void app_hide_install(void)
 		// v17: scheduled on a thread first, and kept as a tick backstop for processes without
 		// libdispatch; see app_hide_schedule_deferred_dyld() for why the first hooked call
 		// alone is no longer sufficient now that stat is interposed.
+		// v18: the tick backstop is gone. libdispatch ships inside libSystem, so every process
+		// that can load this dylib has the thread - and the inline tick path was the last way
+		// for the dyld work to run while dyld was still starting, which is what killed the bank
+		// app in the first place. gAppHideDeferredDyld therefore stays false and the block in
+		// app_hide_tick() is dead code kept only as documentation of the route that failed.
 		app_hide_schedule_deferred_dyld();
-		gAppHideDeferredDyld = true;   // image rewrite + add-image callback: first tick
-		app_hide_note("install", "dyld image work deferred to the first tick");
 
 		app_hide_hook("fork",        (void *)fork,        (void *)app_hide_fork);
 		app_hide_hook("sysctl",      (void *)sysctl,      (void *)app_hide_sysctl);
