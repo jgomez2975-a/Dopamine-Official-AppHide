@@ -163,72 +163,97 @@ static NSError *sAppHideLastError = nil;
 // Dopamine does the collecting: as root and unsandboxed, copy every
 // .DopamineAppHide.log into Documents/AppHideLogs. That folder is exposed to the
 
-// "Hide Jailbreak Environment" can only work if the basebin that is actually installed
-// is this mod's basebin: the switch writes a rules file, and it is launchdhook that
-// consults it at spawn time and systemhook that hides the paths. An un-updated
-// environment (app updated, "Update Environment" never run) leaves a stock basebin in
-// place, and then every switch looks correct and changes nothing - which is exactly the
-// failure being chased. So look for the mod's own strings inside the installed dylibs.
+// "Hide Jailbreak Environment" can only work if the basebin that is actually installed is
+// this mod's basebin: the switch writes a rules file, and systemhook is what consults it and
+// hides the paths. An un-updated environment (app updated, the environment never re-staged)
+// leaves a stock basebin in place, and then every switch looks correct and changes nothing -
+// which is exactly the failure being chased. So look for the mod's own strings inside the
+// installed systemhook.
+//
+// launchdhook.dylib is NOT part of this: the mod does not patch it, so scoring it against
+// systemhook's markers produced a false "部分匹配 ⚠️" on devices where the installation was
+// in fact correct. It is still reported, for information only, and cannot change the verdict.
+
+static NSString *sAppHideSelfCheckText = nil;
+static NSUInteger sAppHideSystemhookHits = 0;
+static NSUInteger sAppHideSystemhookTotal = 0;
+static NSTimeInterval sAppHideSelfCheckAt = 0;
+
 - (NSString *)appHideEnvironmentSelfCheck
 {
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    if (sAppHideSelfCheckText && now - sAppHideSelfCheckAt < 2.0) {
+        return sAppHideSelfCheckText;
+    }
+
     __block NSString *result = nil;
+    __block NSUInteger systemhookHits = 0;
+    __block NSUInteger markerTotal = 0;
 
     [self appHideRunEscaped:^{
         NSString *root = @"/var/jb";
         if (![[NSFileManager defaultManager] fileExistsAtPath:root]) root = @"/";
 
-        NSArray<NSString *> *targets = @[
-            [root stringByAppendingPathComponent:@"basebin/systemhook.dylib"],
-            [root stringByAppendingPathComponent:@"basebin/launchdhook.dylib"],
-        ];
-        NSArray<NSString *> *markers = @[@"app_hide_install", @"canOpenURL", @".DopamineAppHideRules.plist"];
+        // engine v8 / 8 byte thunk hook only exist in a build that carries the short-hook
+        // path, so a clean systemhook cannot fake them.
+        NSArray<NSString *> *markers = @[@"app_hide_install", @"canOpenURL",
+                                        @".DopamineAppHideRules.plist", @"engine v8",
+                                        @"8 byte thunk hook"];
+        markerTotal = markers.count;
+        if (markerTotal == 0) markerTotal = 1;   // never divide by zero
+
+        NSString *systemhookPath = [root stringByAppendingPathComponent:@"basebin/systemhook.dylib"];
+        NSData *systemhook = [NSData dataWithContentsOfFile:systemhookPath options:0 error:nil];
 
         NSMutableArray<NSString *> *lines = [NSMutableArray new];
-        for (NSString *path in targets) {
-            NSData *data = [NSData dataWithContentsOfFile:path options:0 error:nil];
-            NSString *name = path.lastPathComponent;
-            if (!data.length) {
-                [lines addObject:[NSString stringWithFormat:@"%@：读不到", name]];
-                continue;
-            }
-
-            NSUInteger hits = 0;
+        if (!systemhook.length) {
+            [lines addObject:@"systemhook.dylib：读不到"];
+        } else {
             for (NSString *marker in markers) {
-                if ([data rangeOfData:[marker dataUsingEncoding:NSUTF8StringEncoding]
-                              options:0
-                                range:NSMakeRange(0, data.length)].location != NSNotFound) {
-                    hits++;
+                if ([systemhook rangeOfData:[marker dataUsingEncoding:NSUTF8StringEncoding]
+                                    options:0
+                                      range:NSMakeRange(0, systemhook.length)].location != NSNotFound) {
+                    systemhookHits++;
                 }
             }
-            [lines addObject:[NSString stringWithFormat:@"%@：%@（%lu/%lu 标记，%.1f MB）",
-                              name, hits == markers.count ? @"魔改版 ✅" : (hits ? @"部分匹配 ⚠️" : @"原版 ❌"),
-                              (unsigned long)hits, (unsigned long)markers.count,
-                              data.length / 1024.0 / 1024.0]];
+            [lines addObject:[NSString stringWithFormat:@"systemhook.dylib：%@（%lu/%lu 标记，%.1f MB）",
+                              systemhookHits == markers.count ? @"魔改版 ✅" : (systemhookHits ? @"部分匹配 ⚠️" : @"原版 ❌"),
+                              (unsigned long)systemhookHits, (unsigned long)markers.count,
+                              systemhook.length / 1024.0 / 1024.0]];
         }
+
+        // Information only - see the note above.
+        NSString *launchdhookPath = [root stringByAppendingPathComponent:@"basebin/launchdhook.dylib"];
+        NSData *launchdhook = [NSData dataWithContentsOfFile:launchdhookPath options:0 error:nil];
+        [lines addObject:launchdhook.length
+            ? @"launchdhook.dylib：原版（本 mod 不改它，属正常，不影响判定）"
+            : @"launchdhook.dylib：读不到"];
+
         result = [lines componentsJoinedByString:@"\n"];
     }];
 
     if (!result.length) {
-        return @"环境自检：无法提权读取 /var/jb/basebin（先越狱并在 Dopamine 里点 Update Environment）";
+        result = @"systemhook.dylib：读不到（先越狱，再点上面那行「重装隐藏引擎」）";
     }
-    return [NSString stringWithFormat:@"环境自检：\n%@", result];
+
+    sAppHideSelfCheckText = [NSString stringWithFormat:@"环境自检：\n%@", result];
+    sAppHideSystemhookHits = systemhookHits;
+    sAppHideSystemhookTotal = markerTotal;
+    sAppHideSelfCheckAt = now;
+    return sAppHideSelfCheckText;
 }
 
+// The verdict is about the dylib this mod actually patches, and nothing else.
 - (NSString *)appHideBasebinVerdict
 {
-    NSString *full = [self appHideEnvironmentSelfCheck];
+    [self appHideEnvironmentSelfCheck];
 
-    // Worst case wins: a stock launchdhook next to a modded systemhook still means the
-    // spawn time rules are ignored, which is the failure that matters.
-    if ([full rangeOfString:@"原版 ❌"].location != NSNotFound) return @"原版 ❌";
-    if ([full rangeOfString:@"部分匹配 ⚠️"].location != NSNotFound) return @"部分匹配 ⚠️";
-    if ([full rangeOfString:@"读不到"].location != NSNotFound) return @"读不到";
-    if ([full rangeOfString:@"魔改版 ✅"].location != NSNotFound) return @"魔改版 ✅";
-    return @"未知";
+    if (sAppHideSystemhookTotal == 0) return @"未知";
+    if (sAppHideSystemhookHits == 0) return @"原版 ❌";
+    if (sAppHideSystemhookHits < sAppHideSystemhookTotal) return @"部分匹配 ⚠️";
+    return @"魔改版 ✅";
 }
 
-// Files app through UIFileSharingEnabled, which is how the user can see exactly
-// which paths a bank app probed - no Filza, no SSH, no cable.
 static NSString *const kAppHideLogDir  = @"AppHideLogs";
 static NSString *const kAppHideLogName = @".DopamineAppHide.log";
 static NSString *const kAppHideCrashDir = @"CrashReports";
