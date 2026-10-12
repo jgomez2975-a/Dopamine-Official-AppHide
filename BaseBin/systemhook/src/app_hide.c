@@ -252,6 +252,7 @@ static bool app_hide_suspicious_image_path(const char *path);
 // it to run one-shot deferred setup from ordinary app code, which is the only place
 // it is safe to swizzle a class.
 static void app_hide_tick(void);
+static void app_hide_register_image_callback(void);
 
 // Every denial is reported twice: to the unified log (visible with Console /
 // idevicesyslog) and into the hidden app's own container, which is the only
@@ -263,6 +264,12 @@ static void app_hide_tick(void);
 // loader lock, so the unified-log half stays off until app_hide_tick() has run from
 // ordinary app code. The file half below never leaves the process.
 static bool gAppHideSyslogReady = false;
+
+// v16: set when the round 2 set is installed, consumed by the first tick. The image path
+// rewrite and the add-image registration both touch structures dyld is still building while
+// our constructor runs, and doing it there killed the app inside dyld's initializer loop
+// (see the crash note in app_hide_install).
+static bool gAppHideDeferredDyld = false;
 
 static void app_hide_note(const char *func, const char *path)
 {
@@ -1054,6 +1061,15 @@ static void app_hide_tick(void)
 	if (!booted) {
 		booted = true;
 		gAppHideSyslogReady = true;
+
+		// Reached from ordinary app code, i.e. after dyld has finished its initializer
+		// loop - which is exactly why the dyld-touching work waits for it.
+		if (gAppHideDeferredDyld) {
+			gAppHideDeferredDyld = false;
+			app_hide_hide_image_paths();
+			app_hide_register_image_callback();
+		}
+
 		app_hide_install_app_list_hooks();   // no-op until the class exists
 		return;
 	}
@@ -1076,6 +1092,13 @@ static void app_hide_setup_objc(void)
 	p_method_getImplementation = (app_hide_imp_t (*)(app_hide_method_t))dlsym(RTLD_DEFAULT, "method_getImplementation");
 	p_objc_msgSend = dlsym(RTLD_DEFAULT, "objc_msgSend");
 
+	// v16: only resolve here. Registering the callback from the constructor meant running
+	// it while dyld was mid-update - the deferral to app_hide_tick() is what the crash
+	// report demanded.
+}
+
+static void app_hide_register_image_callback(void)
+{
 	if (p_objc_getClass && p_sel_registerName && p_class_getInstanceMethod &&
 	    p_method_setImplementation && p_method_getImplementation && p_objc_msgSend) {
 		_dyld_register_func_for_add_image(app_hide_image_added);
@@ -1102,7 +1125,7 @@ static void app_hide_setup_objc(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v15"
+#define APP_HIDE_ENGINE_VERSION "v16"
 
 typedef struct {
 	const char *name;
@@ -1485,7 +1508,7 @@ void app_hide_install(void)
 		// Moved here in v15: see the note at the default set above.
 		app_hide_hook("fopen",   (void *)fopen,   (void *)app_hide_fopen);
 		app_hide_hook("opendir", (void *)opendir, (void *)app_hide_opendir);
-		app_hide_hide_image_paths();
+		gAppHideDeferredDyld = true;   // image rewrite + add-image callback: first tick
 
 		app_hide_hook("fork",        (void *)fork,        (void *)app_hide_fork);
 		app_hide_hook("sysctl",      (void *)sysctl,      (void *)app_hide_sysctl);
