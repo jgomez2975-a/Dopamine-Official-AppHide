@@ -40,6 +40,7 @@
 #include <mach/vm_map.h>
 #include <mach/task_info.h>
 #include <mach/vm_region.h>
+#include <libkern/OSCacheControl.h>
 // NOTE: <mach/mach_vm.h> is unusable on iOS ("mach_vm.h unsupported."), so the
 // protection dance below uses the vm_* API - vm_address_t is 64 bit on arm64. 
 #include <mach-o/dyld.h>
@@ -1030,7 +1031,9 @@ static bool app_hide_short_hook(void *target, void *replacement)
 	trampoline[3] = app_hide_gen_movk(16, (uint16_t)(destination >> 48), 48);
 	trampoline[4] = app_hide_gen_br(16);
 
-	__builtin___clear_cache((char *)page, (char *)page + 20);
+	// __builtin___clear_cache lowers to ___clear_cache, which iOS does not link; the
+	// platform entry point is the same one litehook uses internally.
+	sys_icache_invalidate(page, 20);
 
 	if (vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false,
 	               VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
