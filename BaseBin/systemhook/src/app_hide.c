@@ -1433,15 +1433,19 @@ void app_hide_install(void)
 		app_hide_hook("sysctlbyname", (void *)sysctlbyname, (void *)app_hide_sysctlbyname);
 		app_hide_note("install", "sysctlbyname");
 		{
+			// statfs64 has no prototype in the iOS SDK (only the symbol exists), so it is
+			// resolved at runtime like every other optional entry point. A NULL result is
+			// treated exactly like a failed self test: no hook.
+			void *statfs64Target = dlsym(RTLD_DEFAULT, "statfs64");
 			bool statfs64Ready = false;
 #ifdef SYS_statfs64
-			{
+			if (statfs64Target) {
 				struct statfs probe = {};
 				statfs64Ready = (syscall(SYS_statfs64, "/", &probe) == 0);
 			}
 #endif
 			if (statfs64Ready) {
-				app_hide_hook("statfs64", (void *)statfs64, (void *)app_hide_statfs64);
+				app_hide_hook("statfs64", statfs64Target, (void *)app_hide_statfs64);
 				app_hide_note("install", "statfs64");
 			}
 			else {
