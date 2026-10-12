@@ -7,6 +7,8 @@
 #ifndef SYSTEMHOOK_APP_HIDE_H
 #define SYSTEMHOOK_APP_HIDE_H
 
+#include <stdbool.h>
+
 // Makes the current process look like it was never jailbroken: hides the
 // jailbreak root and the classic jailbreak paths from the filesystem APIs, and
 // rewrites the paths of the jailbreak dylibs this process still has loaded.
