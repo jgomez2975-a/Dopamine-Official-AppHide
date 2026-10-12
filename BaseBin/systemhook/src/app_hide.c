@@ -226,6 +226,10 @@ static const char *kAppHideEnvPrefixes[] = {
 #define APP_HIDE_LOG_NAME       "/Library/Caches/.DopamineAppHide.log"
 #define APP_HIDE_LOG_MAX_BYTES  (256 * 1024)
 
+// Defined further down with the dyld machinery; declared here because the bundle
+// id matcher reuses it.
+static bool app_hide_suspicious_image_path(const char *path);
+
 // Every denial is reported twice: to the unified log (visible with Console /
 // idevicesyslog) and into the hidden app's own container, which is the only
 // place a sandboxed process may write. The Dopamine side copies those files into
