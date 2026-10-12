@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/sysctl.h>
+#include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <mach/mach.h>
 #include <mach/vm_map.h>
@@ -637,6 +638,195 @@ static int app_hide_statfs(const char *path, struct statfs *buf)
 #endif
 }
 
+// The *at() family. The open/stat/lstat/fopen hooks call through to these, so hooking them
+// naively would recurse - but several SDKs call them directly, and then nothing above is
+// reached. Re-issuing the raw syscall (the same trick the four thunk hooks use) removes the
+// recursion completely: the syscall does not pass through libc.
+//
+// Each one is only installed after app_hide_syscall_ready() has proved that its SYS_ number
+// actually works here: a wrong number would break every file operation in the process.
+
+#ifdef SYS_openat
+static int app_hide_openat(int dirfd, const char *path, int flags, mode_t mode)
+{
+	app_hide_tick();
+	if (app_hide_hidden_path(path)) { app_hide_note("openat", path); errno = ENOENT; return -1; }
+	return (int)syscall(SYS_openat, dirfd, path, flags, mode);
+}
+#endif
+
+#ifdef SYS_fstatat
+static int app_hide_fstatat(int dirfd, const char *path, struct stat *st, int flags)
+{
+	app_hide_tick();
+	if (app_hide_hidden_path(path)) { app_hide_note("fstatat", path); errno = ENOENT; return -1; }
+	return (int)syscall(SYS_fstatat, dirfd, path, st, flags);
+}
+#endif
+
+#ifdef SYS_faccessat
+static int app_hide_faccessat(int dirfd, const char *path, int mode, int flags)
+{
+	app_hide_tick();
+	if (app_hide_hidden_path(path)) { app_hide_note("faccessat", path); errno = ENOENT; return -1; }
+	return (int)syscall(SYS_faccessat, dirfd, path, mode, flags);
+}
+#endif
+
+#ifdef SYS_readlinkat
+static ssize_t app_hide_readlinkat(int dirfd, const char *path, char *buf, size_t size)
+{
+	app_hide_tick();
+	if (app_hide_hidden_path(path)) { app_hide_note("readlinkat", path); errno = ENOENT; return -1; }
+	return (ssize_t)syscall(SYS_readlinkat, dirfd, path, buf, size);
+}
+#endif
+
+// getfsstat / getfsstat64: the per-path hooks cannot hide a mount table. Entries whose mount
+// point or backing device mentions the jailbreak root are dropped, and the returned count is
+// the filtered one - the buffer form and the count-only form both have to agree or the caller
+// sizes its second call wrongly.
+static bool app_hide_jb_mount(const struct statfs *fsx)
+{
+	if (!fsx) return false;
+	if (strstr(fsx->f_mntonname, "/var/jb") || strstr(fsx->f_mntfromname, "/var/jb")) return true;
+#ifdef JBROOT_PATH
+	(void)0;
+#endif
+	if (gAppHideJBRootLen && strncmp(fsx->f_mntonname, gAppHideJBRoot, gAppHideJBRootLen) == 0) return true;
+	return false;
+}
+
+#ifdef SYS_getfsstat
+static int app_hide_getfsstat(struct statfs *buf, int bufsize, int flags)
+{
+	app_hide_tick();
+
+	if (!buf) {
+		struct statfs tmp[32];
+		int n = (int)syscall(SYS_getfsstat, tmp, (int)sizeof(tmp), flags);
+		if (n <= 0) return n;
+		if (n > 32) n = 32;
+		int kept = 0;
+		for (int i = 0; i < n; i++) if (!app_hide_jb_mount(&tmp[i])) kept++;
+		return kept;
+	}
+
+	size_t cap = (size_t)bufsize / sizeof(struct statfs);
+	if (cap == 0) return (int)syscall(SYS_getfsstat, buf, bufsize, flags);
+
+	struct statfs *tmp = (struct statfs *)malloc(cap * sizeof(struct statfs));
+	if (!tmp) return (int)syscall(SYS_getfsstat, buf, bufsize, flags);
+
+	int n = (int)syscall(SYS_getfsstat, tmp, (int)(cap * sizeof(struct statfs)), flags);
+	int kept = 0;
+	for (int i = 0; i < n && (size_t)i < cap; i++) {
+		if (app_hide_jb_mount(&tmp[i])) { app_hide_note("getfsstat", tmp[i].f_mntonname); continue; }
+		buf[kept++] = tmp[i];
+	}
+	free(tmp);
+	return kept;
+}
+#endif
+
+
+#ifdef SYS_getfsstat64
+static int app_hide_getfsstat64(struct statfs64 *buf, int bufsize, int flags)
+{
+	app_hide_tick();
+
+	if (!buf) {
+		struct statfs64 tmp[32];
+		int n = (int)syscall(SYS_getfsstat64, tmp, (int)sizeof(tmp), flags);
+		if (n <= 0) return n;
+		if (n > 32) n = 32;
+		int kept = 0;
+		for (int i = 0; i < n; i++) {
+			if (strstr(tmp[i].f_mntonname, "/var/jb") || strstr(tmp[i].f_mntfromname, "/var/jb")) continue;
+			kept++;
+		}
+		return kept;
+	}
+
+	size_t cap = (size_t)bufsize / sizeof(struct statfs64);
+	if (cap == 0) return (int)syscall(SYS_getfsstat64, buf, bufsize, flags);
+
+	struct statfs64 *tmp = (struct statfs64 *)malloc(cap * sizeof(struct statfs64));
+	if (!tmp) return (int)syscall(SYS_getfsstat64, buf, bufsize, flags);
+
+	int n = (int)syscall(SYS_getfsstat64, tmp, (int)(cap * sizeof(struct statfs64)), flags);
+	int kept = 0;
+	for (int i = 0; i < n && (size_t)i < cap; i++) {
+		if (strstr(tmp[i].f_mntonname, "/var/jb") || strstr(tmp[i].f_mntfromname, "/var/jb")) continue;
+		buf[kept++] = tmp[i];
+	}
+	free(tmp);
+	return kept;
+}
+#endif
+
+// ptrace: only PT_DENY_ATTACH is answered locally. Everything else is forwarded as a raw
+// syscall, so a legitimate ptrace call in a hidden app still behaves normally.
+#ifdef SYS_ptrace
+static int app_hide_ptrace(int request, pid_t pid, caddr_t addr, int data)
+{
+	app_hide_tick();
+#ifdef PT_DENY_ATTACH
+	if (request == PT_DENY_ATTACH) { app_hide_note("ptrace", "PT_DENY_ATTACH"); return 0; }
+#endif
+	return (int)syscall(SYS_ptrace, request, pid, addr, data);
+}
+#endif
+
+// Runs the real syscall once with a path that always exists and a buffer that is big enough,
+// so an install is only attempted when the number in this SDK really is the right one.
+static bool app_hide_syscall_ready(const char *which)
+{
+#ifdef SYS_openat
+	if (strcmp(which, "openat") == 0) {
+		int fd = (int)syscall(SYS_openat, AT_FDCWD, "/dev/null", O_RDONLY, 0);
+		if (fd >= 0) { close(fd); return true; }
+		return false;
+	}
+#endif
+#ifdef SYS_fstatat
+	if (strcmp(which, "fstatat") == 0) {
+		struct stat st;
+		return (int)syscall(SYS_fstatat, AT_FDCWD, "/dev/null", &st, 0) == 0;
+	}
+#endif
+#ifdef SYS_faccessat
+	if (strcmp(which, "faccessat") == 0) {
+		return (int)syscall(SYS_faccessat, AT_FDCWD, "/dev/null", F_OK, 0) == 0;
+	}
+#endif
+#ifdef SYS_readlinkat
+	if (strcmp(which, "readlinkat") == 0) {
+		char buf[PATH_MAX];
+		return (ssize_t)syscall(SYS_readlinkat, AT_FDCWD, "/dev/fd/0", buf, sizeof(buf)) >= 0;
+	}
+#endif
+#ifdef SYS_getfsstat
+	if (strcmp(which, "getfsstat") == 0) {
+		return (int)syscall(SYS_getfsstat, NULL, 0, 0) > 0;
+	}
+#endif
+#ifdef SYS_getfsstat64
+	if (strcmp(which, "getfsstat64") == 0) {
+		return (int)syscall(SYS_getfsstat64, NULL, 0, 0) > 0;
+	}
+#endif
+#ifdef SYS_ptrace
+	if (strcmp(which, "ptrace") == 0) {
+		// Bogus request: a valid syscall number answers EINVAL, a wrong one answers ENOSYS.
+		errno = 0;
+		(void)syscall(SYS_ptrace, 0x7fffffff, 0, NULL, 0);
+		return errno != ENOSYS;
+	}
+#endif
+	return false;
+}
+
 // getattrlist / getattrlistbulk are how NSFileManager asks about files on modern
 // iOS, so a path check that only hooks stat() would be walked straight past.
 static int app_hide_getattrlist(const char *path, void *attrList, void *attrBuf, size_t attrBufSize, unsigned long options)
@@ -892,7 +1082,7 @@ static void app_hide_setup_objc(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v8"
+#define APP_HIDE_ENGINE_VERSION "v9"
 
 typedef struct {
 	const char *name;
@@ -1180,6 +1370,41 @@ void app_hide_install(void)
 		// inside a dyld constructor and swizzling a class while images are still
 		// being loaded is not safe. A process without the ObjC runtime skips it.
 		app_hide_setup_objc();
+		// The *at() family, each only after its syscall number has been proved live.
+		{
+			struct { const char *name; void *handler; bool (*ready)(const char *); } atHooks[] = {
+#ifdef SYS_openat
+				{ "openat",   (void *)app_hide_openat,   app_hide_syscall_ready },
+#endif
+#ifdef SYS_fstatat
+				{ "fstatat",  (void *)app_hide_fstatat,  app_hide_syscall_ready },
+#endif
+#ifdef SYS_faccessat
+				{ "faccessat", (void *)app_hide_faccessat, app_hide_syscall_ready },
+#endif
+#ifdef SYS_readlinkat
+				{ "readlinkat", (void *)app_hide_readlinkat, app_hide_syscall_ready },
+#endif
+#ifdef SYS_getfsstat
+				{ "getfsstat",  (void *)app_hide_getfsstat,  app_hide_syscall_ready },
+#endif
+#ifdef SYS_getfsstat64
+				{ "getfsstat64", (void *)app_hide_getfsstat64, app_hide_syscall_ready },
+#endif
+#ifdef SYS_ptrace
+				{ "ptrace",     (void *)app_hide_ptrace,     app_hide_syscall_ready },
+#endif
+			};
+			for (size_t i = 0; i < sizeof(atHooks) / sizeof(atHooks[0]); i++) {
+				if (!atHooks[i].ready(atHooks[i].name)) {
+					app_hide_note("install", "at() hook not installed - syscall self test failed");
+					continue;
+				}
+				if (app_hide_hook(atHooks[i].name, atHooks[i].handler, NULL)) {
+					app_hide_note("install", atHooks[i].name);
+				}
+			}
+		}
 	}
 	else {
 		app_hide_note("install", "round 2 (fork/sysctl/statfs/getattrlist/LS list) OFF - set _JBEnvMode=2 to enable");

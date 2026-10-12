@@ -194,10 +194,10 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
         NSString *root = @"/var/jb";
         if (![[NSFileManager defaultManager] fileExistsAtPath:root]) root = @"/";
 
-        // engine v8 / 8 byte thunk hook only exist in a build that carries the short-hook
+        // engine v9 / 8 byte thunk hook only exist in a build that carries the short-hook
         // path, so a clean systemhook cannot fake them.
         NSArray<NSString *> *markers = @[@"app_hide_install", @"canOpenURL",
-                                        @".DopamineAppHideRules.plist", @"engine v8",
+                                        @".DopamineAppHideRules.plist", @"engine v9",
                                         @"8 byte thunk hook"];
         markerTotal = markers.count;
         if (markerTotal == 0) markerTotal = 1;   // never divide by zero
