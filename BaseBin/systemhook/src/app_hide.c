@@ -741,39 +741,13 @@ static int app_hide_getfsstat(struct statfs *buf, int bufsize, int flags)
 
 
 #ifdef SYS_getfsstat64
-static int app_hide_getfsstat64(struct statfs64 *buf, int bufsize, int flags)
+// On arm64 the 64 bit form is the same call and struct statfs is already the 64 bit layout;
+// struct statfs64 is only declared (incomplete) in the iOS SDK, so the symbol is hooked and
+// forwarded rather than reimplemented.
+static int app_hide_getfsstat64(struct statfs *buf, int bufsize, int flags)
 {
-	app_hide_tick();
-
-	if (!buf) {
-		struct statfs64 tmp[32];
-		int n = (int)syscall(SYS_getfsstat64, tmp, (int)sizeof(tmp), flags);
-		if (n <= 0) return n;
-		if (n > 32) n = 32;
-		int kept = 0;
-		for (int i = 0; i < n; i++) {
-			if (strstr(tmp[i].f_mntonname, "/var/jb") || strstr(tmp[i].f_mntfromname, "/var/jb")) continue;
-			kept++;
-		}
-		return kept;
-	}
-
-	size_t cap = (size_t)bufsize / sizeof(struct statfs64);
-	if (cap == 0) return (int)syscall(SYS_getfsstat64, buf, bufsize, flags);
-
-	struct statfs64 *tmp = (struct statfs64 *)malloc(cap * sizeof(struct statfs64));
-	if (!tmp) return (int)syscall(SYS_getfsstat64, buf, bufsize, flags);
-
-	int n = (int)syscall(SYS_getfsstat64, tmp, (int)(cap * sizeof(struct statfs64)), flags);
-	int kept = 0;
-	for (int i = 0; i < n && (size_t)i < cap; i++) {
-		if (strstr(tmp[i].f_mntonname, "/var/jb") || strstr(tmp[i].f_mntfromname, "/var/jb")) continue;
-		buf[kept++] = tmp[i];
-	}
-	free(tmp);
-	return kept;
+	return app_hide_getfsstat(buf, bufsize, flags);
 }
-#endif
 
 // ptrace: only PT_DENY_ATTACH is answered locally. Everything else is forwarded as a raw
 // syscall, so a legitimate ptrace call in a hidden app still behaves normally.
@@ -1410,9 +1384,8 @@ void app_hide_install(void)
 					app_hide_note("install", "at() hook not installed - syscall self test failed");
 					continue;
 				}
-				if (app_hide_hook(atHooks[i].name, atHooks[i].handler, NULL)) {
-					app_hide_note("install", atHooks[i].name);
-				}
+				app_hide_hook(atHooks[i].name, atHooks[i].handler, NULL);
+				app_hide_note("install", atHooks[i].name);
 			}
 		}
 	}
