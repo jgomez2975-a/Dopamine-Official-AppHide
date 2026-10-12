@@ -1509,6 +1509,7 @@ void app_hide_install(void)
 		app_hide_hook("fopen",   (void *)fopen,   (void *)app_hide_fopen);
 		app_hide_hook("opendir", (void *)opendir, (void *)app_hide_opendir);
 		gAppHideDeferredDyld = true;   // image rewrite + add-image callback: first tick
+		app_hide_note("install", "dyld image work deferred to the first tick");
 
 		app_hide_hook("fork",        (void *)fork,        (void *)app_hide_fork);
 		app_hide_hook("sysctl",      (void *)sysctl,      (void *)app_hide_sysctl);
