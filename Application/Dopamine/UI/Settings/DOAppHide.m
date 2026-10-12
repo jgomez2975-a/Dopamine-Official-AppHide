@@ -719,7 +719,7 @@ static const NSUInteger kAppHideCrashKeep = 12;
     __block BOOL ok = NO;
     [self appHideRunEscaped:^{
         NSFileManager *fm = [NSFileManager defaultManager];
-        [@(enhanced ? @"0" : @"1") writeToFile:path atomically:YES
+        [(enhanced ? @"0" : @"1") writeToFile:path atomically:YES
                 encoding:NSUTF8StringEncoding error:nil];
         if ([fm fileExistsAtPath:path]) {
             chown(path.fileSystemRepresentation, APP_HIDE_RULES_OWNER, APP_HIDE_RULES_GROUP);
