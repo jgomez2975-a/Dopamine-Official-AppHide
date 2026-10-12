@@ -216,6 +216,7 @@ static const char *kAppHideJBProcessNames[] = {
 static const char *kAppHideEnvPrefixes[] = {
 	"DYLD_INSERT_LIBRARIES=",
 	"DOPAMINE_APP_HIDE=",
+	"_JBEnvMode=",
 	"JB_ROOT_PATH=",
 	"_SafeMode=",
 	"_MSSafeMode=",
@@ -226,20 +227,36 @@ static const char *kAppHideEnvPrefixes[] = {
 #define APP_HIDE_LOG_NAME       "/Library/Caches/.DopamineAppHide.log"
 #define APP_HIDE_LOG_MAX_BYTES  (256 * 1024)
 
+// The variable the basebin sets to tell systemhook "this app is hidden". Deliberately
+// not named after the tweak: a hardening SDK that greps its own environment for
+// "DOPAMINE" should not get a free hit. The old name is still accepted.
+#define APP_HIDE_ENV_MARKER     "_JBEnvMode"
+
 // Defined further down with the dyld machinery; declared here because the bundle
 // id matcher reuses it.
 static bool app_hide_suspicious_image_path(const char *path);
+
+// Defined with the LaunchServices machinery further down. The hooked functions call
+// it to run one-shot deferred setup from ordinary app code, which is the only place
+// it is safe to swizzle a class.
+static void app_hide_tick(void);
 
 // Every denial is reported twice: to the unified log (visible with Console /
 // idevicesyslog) and into the hidden app's own container, which is the only
 // place a sandboxed process may write. The Dopamine side copies those files into
 // its Documents folder, so the user can read what the app actually probed
 // without any extra tooling.
+// syslog(3) can lazily open a connection to the logging daemon; doing that from a
+// dyld constructor (which is where app_hide_install() runs) risks a deadlock on the
+// loader lock, so the unified-log half stays off until app_hide_tick() has run from
+// ordinary app code. The file half below never leaves the process.
+static bool gAppHideSyslogReady = false;
+
 static void app_hide_note(const char *func, const char *path)
 {
 	if (!func) return;
 
-	syslog(LOG_ERR, "[AppHide] %s %s", func, path ? path : "-");
+	if (gAppHideSyslogReady) syslog(LOG_ERR, "[AppHide] %s %s", func, path ? path : "-");
 
 	const char *home = getenv("HOME");
 	if (!home || home[0] != '/') return;
@@ -426,30 +443,35 @@ static void app_hide_hide_image_paths(void)
 
 static int app_hide_stat(const char *path, struct stat *buf)
 {
+	app_hide_tick();
 	if (app_hide_hidden_path(path)) { app_hide_note("stat", path); errno = ENOENT; return -1; }
 	return fstatat(AT_FDCWD, path, buf, 0);
 }
 
 static int app_hide_lstat(const char *path, struct stat *buf)
 {
+	app_hide_tick();
 	if (app_hide_hidden_path(path)) { app_hide_note("lstat", path); errno = ENOENT; return -1; }
 	return fstatat(AT_FDCWD, path, buf, AT_SYMLINK_NOFOLLOW);
 }
 
 static int app_hide_access(const char *path, int mode)
 {
+	app_hide_tick();
 	if (app_hide_hidden_path(path)) { app_hide_note("access", path); errno = ENOENT; return -1; }
 	return faccessat(AT_FDCWD, path, mode, 0);
 }
 
 static int app_hide_open(const char *path, int oflag, mode_t mode)
 {
+	app_hide_tick();
 	if (app_hide_hidden_path(path)) { app_hide_note("open", path); errno = ENOENT; return -1; }
 	return openat(AT_FDCWD, path, oflag, mode);
 }
 
 static ssize_t app_hide_readlink(const char *path, char *buf, size_t bufsize)
 {
+	app_hide_tick();
 	if (app_hide_hidden_path(path)) { app_hide_note("readlink", path); errno = ENOENT; return -1; }
 	return readlinkat(AT_FDCWD, path, buf, bufsize);
 }
@@ -457,6 +479,7 @@ static ssize_t app_hide_readlink(const char *path, char *buf, size_t bufsize)
 // fopen is reachable through openat + fdopen, so the original is not needed.
 static FILE *app_hide_fopen(const char *path, const char *mode)
 {
+	app_hide_tick();
 	if (app_hide_hidden_path(path)) { app_hide_note("fopen", path); errno = ENOENT; return NULL; }
 
 	const char *m = mode ? mode : "r";
@@ -487,6 +510,7 @@ static FILE *app_hide_fopen(const char *path, const char *mode)
 // opendir is reachable through openat + fdopendir.
 static DIR *app_hide_opendir(const char *path)
 {
+	app_hide_tick();
 	if (app_hide_hidden_path(path)) { app_hide_note("opendir", path); errno = ENOENT; return NULL; }
 
 	int fd = openat(AT_FDCWD, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -506,6 +530,7 @@ static void app_hide_filter_process_list(void *buffer, size_t *lengthPtr);
 // jailbroken one it succeeds. Nothing an app does legitimately needs it.
 static pid_t app_hide_fork(void)
 {
+	app_hide_tick();
 	app_hide_note("fork", NULL);
 	errno = EPERM;
 	return -1;
@@ -517,6 +542,7 @@ static pid_t app_hide_fork(void)
 // untouched, which is what dyld and libsystem rely on.
 static int app_hide_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen)
 {
+	app_hide_tick();
 #ifdef SYS_sysctl
 	int ret = (int)syscall(SYS_sysctl, name, namelen, oldp, oldlenp, newp, newlen);
 #else
@@ -600,6 +626,7 @@ static void app_hide_filter_process_list(void *buffer, size_t *lengthPtr)
 
 static int app_hide_statfs(const char *path, struct statfs *buf)
 {
+	app_hide_tick();
 	if (app_hide_hidden_path(path)) { app_hide_note("statfs", path); errno = ENOENT; return -1; }
 #ifdef SYS_statfs
 	return (int)syscall(SYS_statfs, path, buf);
@@ -613,6 +640,7 @@ static int app_hide_statfs(const char *path, struct statfs *buf)
 // iOS, so a path check that only hooks stat() would be walked straight past.
 static int app_hide_getattrlist(const char *path, void *attrList, void *attrBuf, size_t attrBufSize, unsigned long options)
 {
+	app_hide_tick();
 	if (app_hide_hidden_path(path)) { app_hide_note("getattrlist", path); errno = ENOENT; return -1; }
 #ifdef SYS_getattrlist
 	return (int)syscall(SYS_getattrlist, path, attrList, attrBuf, attrBufSize, options);
@@ -735,19 +763,43 @@ static void app_hide_install_app_list_hooks(void)
 	gAppListHooked = true;
 }
 
-// LSApplicationWorkspace lives in a framework the app loads on demand, so the
-// hook is installed from the image-added callback (and once eagerly, in case the
-// framework is already loaded).
+// LSApplicationWorkspace lives in a framework the app loads on demand. The hook is
+// NOT installed from here: this callback runs on dyld's own thread while images are
+// still being loaded, and swizzling a class at that point is what makes a launch
+// unpredictable. Just raise the flag and let app_hide_tick() do it from ordinary app
+// code.
+static volatile bool gAppListRetry = false;
+
 static void app_hide_image_added(const struct mach_header *header, intptr_t slide)
 {
 	(void)header; (void)slide;
-	if (!gAppListHooked) app_hide_install_app_list_hooks();
+	// The framework carrying the class just landed; let the next tick install.
+	if (!gAppListHooked) gAppListRetry = true;
+}
+
+// Deferred, one-shot setup. Called from the hooked functions, i.e. from ordinary app
+// execution well past dyld init. Cheap once done: one bool test per call.
+static void app_hide_tick(void)
+{
+	static bool booted = false;
+	if (!booted) {
+		booted = true;
+		gAppHideSyslogReady = true;
+		app_hide_install_app_list_hooks();   // no-op until the class exists
+		return;
+	}
+	if (gAppListRetry) {
+		gAppListRetry = false;
+		app_hide_install_app_list_hooks();
+	}
 }
 
 static void app_hide_setup_objc(void)
 {
-	void *handle = dlopen("/usr/lib/libobjc.A.dylib", RTLD_LAZY);
-	(void)handle;
+	// No dlopen here on purpose. This function runs inside systemhook's constructor,
+	// where dyld still holds the loader lock - re-entering it to load an image can
+	// deadlock the launch. libobjc is already mapped in any app process, and dlsym
+	// simply returns NULL when it is not, which skips the feature.
 	p_objc_getClass = (app_hide_class_t (*)(const char *))dlsym(RTLD_DEFAULT, "objc_getClass");
 	p_sel_registerName = (app_hide_sel_t (*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
 	p_class_getInstanceMethod = (app_hide_method_t (*)(app_hide_class_t, app_hide_sel_t))dlsym(RTLD_DEFAULT, "class_getInstanceMethod");
@@ -757,8 +809,123 @@ static void app_hide_setup_objc(void)
 
 	if (p_objc_getClass && p_sel_registerName && p_class_getInstanceMethod &&
 	    p_method_setImplementation && p_method_getImplementation && p_objc_msgSend) {
-		app_hide_install_app_list_hooks();
 		_dyld_register_func_for_add_image(app_hide_image_added);
+	}
+}
+
+#pragma mark - hook installation guard
+
+// litehook_hook_function() overwrites a FIXED 20 bytes at the target entry (five
+// instructions: four MOVK x16 + BR x16) and does not look at the function's size or
+// at instruction boundaries. On arm64 Darwin, libsystem_kernel exports most syscall
+// entry points as 12 byte thunks
+//
+//     mov  x16, #nr        ; 4 bytes
+//     svc  #0x80           ; 4 bytes
+//     b    _cerror         ; 4 bytes
+//
+// and those thunks sit back to back in the dyld shared cache. Patching one therefore
+// rewrites the first 8 bytes of the NEXT symbol in the same slice, and every caller
+// of that neighbour executes garbage and dies - which is exactly what happened when
+// fork/sysctl/statfs/getattrlist were added: the app crashed on launch.
+//
+// So: only patch a function whose first five instructions are straight line code that
+// cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
+// costs the launch.
+#define APP_HIDE_HOOK_MAX 24
+#define APP_HIDE_ENGINE_VERSION "v6"
+
+typedef struct {
+	const char *name;
+	bool installed;
+	const char *skipReason;
+} app_hide_hook_result;
+
+static app_hide_hook_result gAppHideHooks[APP_HIDE_HOOK_MAX];
+static size_t gAppHideHookCount = 0;
+static size_t gHookedCount = 0;
+static size_t gSkippedCount = 0;
+
+#ifdef __arm64__
+static bool app_hide_insn_leaves_flow(uint32_t insn)
+{
+	if ((insn & 0xFFFFFC1F) == 0xD65F0000) return true;   // ret
+	if ((insn & 0xFFFFFC1F) == 0xD61F0000) return true;   // br  xN
+	if ((insn & 0xFFFFFC1F) == 0xD63F0000) return true;   // blr xN
+	if ((insn & 0xFC000000) == 0x14000000) return true;   // b   imm
+	if ((insn & 0xFC000000) == 0x94000000) return true;   // bl  imm
+	if ((insn & 0xFF000010) == 0x54000000) return true;   // b.cond
+	if ((insn & 0x7E000000) == 0x34000000) return true;   // cbz / cbnz
+	if ((insn & 0x7E000000) == 0x36000000) return true;   // tbz / tbnz
+	if (insn == 0xD4000001) return true;                  // svc #0x80
+	return false;
+}
+
+static bool app_hide_function_is_patchable(const void *function)
+{
+	if (!function) return false;
+
+	const uint32_t *insn = (const uint32_t *)function;
+	// litehook consumes instructions 1-4 and replaces the fifth, so none of the
+	// first four may leave that window.
+	for (size_t i = 0; i < 4; i++) {
+		if (app_hide_insn_leaves_flow(insn[i])) return false;
+	}
+	return true;
+}
+#else
+static bool app_hide_function_is_patchable(const void *function)
+{
+	return function != NULL;
+}
+#endif
+
+static void app_hide_hook(const char *name, void *target, void *replacement)
+{
+	const char *skipReason = NULL;
+
+	if (!target) {
+		skipReason = "symbol not found";
+	}
+	else if (!app_hide_function_is_patchable(target)) {
+		skipReason = "short stub - a 20 byte patch would clobber the next symbol";
+	}
+
+	bool installed = false;
+	if (!skipReason) {
+		installed = litehook_hook_function(target, replacement) == KERN_SUCCESS;
+		if (!installed) skipReason = "litehook rejected the address";
+	}
+
+	if (gAppHideHookCount < APP_HIDE_HOOK_MAX) {
+		gAppHideHooks[gAppHideHookCount].name = name;
+		gAppHideHooks[gAppHideHookCount].installed = installed;
+		gAppHideHooks[gAppHideHookCount].skipReason = skipReason;
+		gAppHideHookCount++;
+	}
+	if (installed) gHookedCount++; else gSkippedCount++;
+}
+
+// Every hook outcome goes into the log the user can read from the Files app, so
+// "which part of the engine is actually live on this iOS version" is a fact rather
+// than a guess.
+static void app_hide_report_hooks(void)
+{
+	char line[160];
+
+	snprintf(line, sizeof(line), "engine " APP_HIDE_ENGINE_VERSION ": %zu hooks active, %zu skipped",
+	         gHookedCount, gSkippedCount);
+	app_hide_note("install", line);
+
+	for (size_t i = 0; i < gAppHideHookCount; i++) {
+		if (gAppHideHooks[i].installed) {
+			snprintf(line, sizeof(line), "%s installed", gAppHideHooks[i].name);
+		}
+		else {
+			snprintf(line, sizeof(line), "%s SKIPPED (%s)", gAppHideHooks[i].name,
+			         gAppHideHooks[i].skipReason ? gAppHideHooks[i].skipReason : "unknown");
+		}
+		app_hide_note("hook", line);
 	}
 }
 
@@ -768,7 +935,8 @@ void app_hide_install(void)
 {
 	if (gAppHideActive) return;
 
-	const char *marker = getenv("DOPAMINE_APP_HIDE");
+	const char *marker = getenv(APP_HIDE_ENV_MARKER);
+	if (!marker) marker = getenv("DOPAMINE_APP_HIDE");   // older basebin
 	if (!marker || strcmp(marker, "1") != 0) return;
 
 	if (JB_RootPath && JB_RootPath[0] == '/') {
@@ -792,39 +960,36 @@ void app_hide_install(void)
 	// which goes through the functions we are about to replace.
 	app_hide_hide_image_paths();
 
-	if (litehook_hook_function((void *)stat,     (void *)app_hide_stat)     == KERN_SUCCESS) gHookedCount++;
-	if (litehook_hook_function((void *)lstat,    (void *)app_hide_lstat)    == KERN_SUCCESS) gHookedCount++;
-	if (litehook_hook_function((void *)access,   (void *)app_hide_access)   == KERN_SUCCESS) gHookedCount++;
-	if (litehook_hook_function((void *)open,     (void *)app_hide_open)     == KERN_SUCCESS) gHookedCount++;
-	if (litehook_hook_function((void *)fopen,    (void *)app_hide_fopen)    == KERN_SUCCESS) gHookedCount++;
-	if (litehook_hook_function((void *)opendir,  (void *)app_hide_opendir)  == KERN_SUCCESS) gHookedCount++;
-	if (litehook_hook_function((void *)readlink, (void *)app_hide_readlink) == KERN_SUCCESS) gHookedCount++;
+	// Every one of these goes through app_hide_hook(), which refuses to touch a
+	// function that litehook's fixed 20 byte patch would spill into its neighbour.
+	app_hide_hook("stat",     (void *)stat,     (void *)app_hide_stat);
+	app_hide_hook("lstat",    (void *)lstat,    (void *)app_hide_lstat);
+	app_hide_hook("access",   (void *)access,   (void *)app_hide_access);
+	app_hide_hook("open",     (void *)open,     (void *)app_hide_open);
+	app_hide_hook("fopen",    (void *)fopen,    (void *)app_hide_fopen);
+	app_hide_hook("opendir",  (void *)opendir,  (void *)app_hide_opendir);
+	app_hide_hook("readlink", (void *)readlink, (void *)app_hide_readlink);
 
 	// Round 2: the checks a banking app's hardening SDK reaches for after the
-	// plain file probes came back clean.
-	if (litehook_hook_function((void *)fork, (void *)app_hide_fork) == KERN_SUCCESS) gHookedCount++;
-#ifdef SYS_sysctl
-	if (litehook_hook_function((void *)sysctl, (void *)app_hide_sysctl) == KERN_SUCCESS) gHookedCount++;
-#endif
-#ifdef SYS_statfs
-	if (litehook_hook_function((void *)statfs, (void *)app_hide_statfs) == KERN_SUCCESS) gHookedCount++;
-#endif
-#ifdef SYS_getattrlist
-	if (litehook_hook_function((void *)getattrlist, (void *)app_hide_getattrlist) == KERN_SUCCESS) gHookedCount++;
-#endif
+	// plain file probes came back clean. These are the ones most likely to be
+	// unreachable syscall thunks, in which case they are skipped instead of
+	// corrupting the shared cache.
+	app_hide_hook("fork",        (void *)fork,        (void *)app_hide_fork);
+	app_hide_hook("sysctl",      (void *)sysctl,      (void *)app_hide_sysctl);
+	app_hide_hook("statfs",      (void *)statfs,      (void *)app_hide_statfs);
+	app_hide_hook("getattrlist", (void *)getattrlist, (void *)app_hide_getattrlist);
 
-	// Installed-application list (LaunchServices): resolved through dlsym, so a
-	// process without the ObjC runtime simply skips it.
+	// Installed-application list (LaunchServices): resolved through dlsym and
+	// installed later, from app_hide_tick() - never from here, because this runs
+	// inside a dyld constructor and swizzling a class while images are still being
+	// loaded is not safe. A process without the ObjC runtime skips it entirely.
 	app_hide_setup_objc();
 
-	// One line of evidence in the log that the engine came up (and how much of it
-	// the running iOS allowed to install).
-	char summary[64];
-	snprintf(summary, sizeof(summary), "%zu hooks active", gHookedCount);
-	app_hide_note("install", summary);
+	app_hide_report_hooks();
 
 	// The app must not see any of the variables that got us here. Safe now:
 	// should_enable_tweaks() has already decided, and the check-in is done.
+	unsetenv(APP_HIDE_ENV_MARKER);
 	unsetenv("DOPAMINE_APP_HIDE");
 	unsetenv("JB_ROOT_PATH");
 	unsetenv("_SafeMode");

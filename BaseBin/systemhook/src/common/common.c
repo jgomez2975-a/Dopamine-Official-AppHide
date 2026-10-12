@@ -431,11 +431,13 @@ static int spawn_exec_hook_common(bool isExec,
 		}
 
 		if (shouldHideAppEnv && shouldInsertJBEnv) {
-			// App Hide: inject systemhook only, and tell it (DOPAMINE_APP_HIDE) that the
+			// App Hide: inject systemhook only, and tell it (_JBEnvMode) that the
 			// jailbreak has to stay invisible inside this process. DYLD_IN_CACHE=0 is what
 			// makes dyld honour the insert instead of rejecting it as a shared cache image.
+			// The marker is deliberately not named after the tweak: an app that greps its
+			// own environment for "DOPAMINE" should not get a free hit.
 			envbuf_setenv(&envc, "DYLD_INSERT_LIBRARIES", HOOK_DYLIB_PATH);
-			envbuf_setenv(&envc, "DOPAMINE_APP_HIDE", "1");
+			envbuf_setenv(&envc, "_JBEnvMode", "1");
 			envbuf_setenv(&envc, "DYLD_IN_CACHE", "0");
 			envbuf_unsetenv(&envc, "_SafeMode");
 			envbuf_unsetenv(&envc, "_MSSafeMode");

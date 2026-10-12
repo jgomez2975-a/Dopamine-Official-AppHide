@@ -121,12 +121,15 @@ static NSError *sAppHideLastError = nil;
 // which paths a bank app probed - no Filza, no SSH, no cable.
 static NSString *const kAppHideLogDir  = @"AppHideLogs";
 static NSString *const kAppHideLogName = @".DopamineAppHide.log";
+static NSString *const kAppHideCrashDir = @"CrashReports";
 static const NSUInteger kAppHideLogKeep = 40;
+static const NSUInteger kAppHideCrashKeep = 12;
 
 - (NSString *)appHideCollectLogs
 {
     __block NSUInteger copied = 0;
     __block NSUInteger found = 0;
+    __block NSUInteger crashCopied = 0;
 
     NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     if (!documents) return @"检测日志：拿不到 Documents 目录";
@@ -160,11 +163,41 @@ static const NSUInteger kAppHideLogKeep = 40;
                 [fm removeItemAtPath:[outDir stringByAppendingPathComponent:existing[i]] error:nil];
             }
         }
+
+        // Crash reports. If a hidden app is killed at launch, its .ips is the only
+        // way to tell WHY without a cable - it names the faulting image and the
+        // faulting instruction, which is what distinguishes "a hook smashed a
+        // neighbouring symbol" from "the app detected the jailbreak and exited".
+        NSString *crashRoot = @"/var/mobile/Library/Logs/CrashReporter";
+        NSString *crashDir = [outDir stringByAppendingPathComponent:kAppHideCrashDir];
+        NSDate *cutoff = [NSDate dateWithTimeIntervalSinceNow:-24 * 3600];
+        NSMutableArray<NSDictionary *> *recent = [NSMutableArray new];
+        for (NSString *name in [fm contentsOfDirectoryAtPath:crashRoot error:nil]) {
+            if (![name hasSuffix:@".ips"]) continue;
+            NSString *src = [crashRoot stringByAppendingPathComponent:name];
+            NSDate *mtime = [fm attributesOfItemAtPath:src error:nil][NSFileModificationDate];
+            if (!mtime || [mtime compare:cutoff] == NSOrderedAscending) continue;
+            [recent addObject:@{ @"path": src, @"mtime": mtime }];
+        }
+        [recent sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [b[@"mtime"] compare:a[@"mtime"]];
+        }];
+        if (recent.count > 0) {
+            [fm createDirectoryAtPath:crashDir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSUInteger limit = MIN(recent.count, (NSUInteger)kAppHideCrashKeep);
+            for (NSUInteger i = 0; i < limit; i++) {
+                NSString *src = recent[i][@"path"];
+                NSString *dest = [crashDir stringByAppendingPathComponent:src.lastPathComponent];
+                if ([fm fileExistsAtPath:dest]) continue;
+                if ([fm copyItemAtPath:src toPath:dest error:nil]) crashCopied++;
+            }
+        }
     }];
 
-    if (found == 0) return @"检测日志：还没有 App 探过被隐藏的路径（先跑一次目标 App）";
-    return [NSString stringWithFormat:@"检测日志：%lu 个 App 有记录，新导出 %lu 个到 文件App/我的iPhone/Dopamine/%@",
-            (unsigned long)found, (unsigned long)copied, kAppHideLogDir];
+    if (found == 0 && crashCopied == 0) return @"检测日志：还没有 App 探过被隐藏的路径（先跑一次目标 App）";
+    return [NSString stringWithFormat:
+            @"检测日志：%lu 个 App 有记录，新导出 %lu 个日志、%lu 个崩溃报告到 文件App/我的iPhone/Dopamine/%@",
+            (unsigned long)found, (unsigned long)copied, (unsigned long)crashCopied, kAppHideLogDir];
 }
 
 - (BOOL)writeAppHideRules:(NSDictionary<NSString *, NSDictionary *> *)rules error:(NSError **)error

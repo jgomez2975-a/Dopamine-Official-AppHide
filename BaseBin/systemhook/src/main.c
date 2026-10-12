@@ -208,7 +208,8 @@ bool should_enable_tweaks(void)
 			return false;
 		}
 	}
-	char *appHideEnv = getenv("DOPAMINE_APP_HIDE");
+	char *appHideEnv = getenv("_JBEnvMode");
+	if (!appHideEnv) appHideEnv = getenv("DOPAMINE_APP_HIDE");	// older basebin
 	if (appHideEnv && !strcmp(appHideEnv, "1")) {
 		// App Hide: the spawn hook in common.c marked this process as "jailbreak invisible",
 		// so no tweak may be loaded into it.
@@ -506,7 +507,7 @@ __attribute__((constructor)) static void initializer(void)
 		// Feeable attempt at adding back CS_VALID
 		jbclient_cs_revalidate();
 #endif
-		// App Hide: launchdhook spawned us with DOPAMINE_APP_HIDE=1, so hide the
+		// App Hide: launchdhook spawned us with _JBEnvMode=1, so hide the
 		// jailbreak from this process (paths, image list, environment).
 		app_hide_install();
 	}
