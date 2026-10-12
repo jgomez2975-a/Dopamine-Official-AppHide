@@ -35,7 +35,6 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/sysctl.h>
-#include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <mach/mach.h>
 #include <mach/vm_map.h>
@@ -232,6 +231,17 @@ static const char *kAppHideEnvPrefixes[] = {
 // The variable the basebin sets to tell systemhook "this app is hidden". Deliberately
 // not named after the tweak: a hardening SDK that greps its own environment for
 // "DOPAMINE" should not get a free hit. The old name is still accepted.
+// iOS ships no <sys/ptrace.h>, and the ptrace numbers are fixed by the kernel ABI. The
+// ptrace hook self-tests its own syscall number before installing (a bogus request answers
+// EINVAL when the number is right and ENOSYS when it is not), so a wrong guess cannot break
+// the process - it just leaves the hook uninstalled.
+#ifndef PT_DENY_ATTACH
+#define PT_DENY_ATTACH 31
+#endif
+#ifndef SYS_ptrace
+#define SYS_ptrace 26
+#endif
+
 #define APP_HIDE_ENV_MARKER     "_JBEnvMode"
 
 // Defined further down with the dyld machinery; declared here because the bundle
