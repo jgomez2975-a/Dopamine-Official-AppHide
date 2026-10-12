@@ -564,6 +564,23 @@ static DIR *app_hide_opendir(const char *path)
 // sibling (fstatat / faccessat / openat / readlinkat), never to the interposed name, so an
 // interposed call cannot re-enter itself. A process that is not being hidden has
 // app_hide_hidden_path() return false, so its only cost is one predicate per call.
+// The interpose table below sits above the definitions of the *at() family and the filesystem
+// handlers, so they are declared here first. Signatures are copied from the definitions verbatim.
+#ifdef SYS_fstatat
+static int app_hide_fstatat(int dirfd, const char *path, struct stat *st, int flags);
+#endif
+#ifdef SYS_faccessat
+static int app_hide_faccessat(int dirfd, const char *path, int mode, int flags);
+#endif
+#ifdef SYS_openat
+static int app_hide_openat(int dirfd, const char *path, int flags, mode_t mode);
+#endif
+#ifdef SYS_readlinkat
+static ssize_t app_hide_readlinkat(int dirfd, const char *path, char *buf, size_t size);
+#endif
+static int app_hide_statfs(const char *path, struct statfs *buf);
+static int app_hide_getattrlist(const char *path, void *attrList, void *attrBuf, size_t attrBufSize, unsigned long options);
+
 #define APP_HIDE_INTERPOSE(replacement, replacee)                                  \
 	__attribute__((used)) static struct {                                          \
 		const void *replacement;                                                   \
