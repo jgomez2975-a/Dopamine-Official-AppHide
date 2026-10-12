@@ -14,7 +14,7 @@
 // Version of the panel code itself, shown in the first row. The engine inside the
 // basebin has its own version (it logs "engine vN"), and keeping them visible together
 // is how "the app updated but the basebin did not" stops being invisible.
-#define APP_HIDE_PANEL_VERSION @"v11"
+#define APP_HIDE_PANEL_VERSION @"v13"
 
 // Name matching for the search field. Substring first, then subsequence, so the
 // short forms people actually type still find the app: "农行" -> 中国农业银行
@@ -219,6 +219,34 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     checkSpecifier.buttonAction = NSSelectorFromString(@"appHideEnvironmentCheck");
     [specifiers addObject:checkSpecifier];
 
+    // The stock "Update Environment" button only appears when Dopamine sees the installed
+    // basebin version differ from its own, and this mod keeps upstream's version number, so
+    // on a device that already has that version the button never shows - and the new basebin
+    // never gets installed. This row calls the same upstream method the stock button calls.
+    PSSpecifier *updateSpecifier = [PSSpecifier preferenceSpecifierNamed:@"重装隐藏引擎（Update Environment）"
+                                                                  target:self
+                                                                     set:nil
+                                                                     get:nil
+                                                                  detail:nil
+                                                                    cell:PSButtonCell
+                                                                    edit:nil];
+    [updateSpecifier setProperty:@YES forKey:@"enabled"];
+    [updateSpecifier setProperty:[DOButtonCell class] forKey:@"cellClass"];
+    [updateSpecifier setProperty:@"appHideStageUpdate" forKey:@"action"];
+    updateSpecifier.buttonAction = NSSelectorFromString(@"appHideStageUpdate");
+    [specifiers addObject:updateSpecifier];
+
+    PSSpecifier *versionGroup = [PSSpecifier emptyGroupSpecifier];
+    versionGroup.name = @"引擎版本对照";
+    [versionGroup setProperty:[NSString stringWithFormat:
+                                   @"本 App：%@\n已装 basebin：%@%@\n两者显示同一个版本号是正常的 —— "
+                                   @"这也是首页不出现 Update Environment 的原因，所以重装入口放在上面。",
+                               [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?",
+                               [envManager jailbrokenVersion] ?: @"（未越狱 / 读不到）",
+                               [envManager isJailbroken] ? @"" : @"（当前未越狱，重装会失败）"]
+                       forKey:@"footerText"];
+    [specifiers addObject:versionGroup];
+
     // The same text as a group footer, so the answer is on screen without any tap: two
     // broken buttons in a row is what this costs when a diagnostic hides behind one.
     PSSpecifier *checkGroup = [PSSpecifier emptyGroupSpecifier];
@@ -403,7 +431,7 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     NSString *message = [NSString stringWithFormat:
                          @"面板版本：%@\nbasebin 判定：%@\n\n%@\n\n"
                          @"说明：魔改版 ✅ = 装上的 basebin 是这一版（开关才会真的生效）；"
-                         @"原版 ❌ = App 换了但 basebin 没换，回 Dopamine 首页点一次 Update Environment 再 respring。",
+                         @"原版 ❌ = App 换了但 basebin 没换，点上面那行「重装隐藏引擎」再 respring。",
                          APP_HIDE_PANEL_VERSION, verdict, detail];
     DOAppHideTrace([@"self-check: " stringByAppendingString:verdict]);
 
@@ -424,6 +452,53 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
+}
+
+#pragma mark - basebin reinstall
+
+// The stock button lives behind a version check that this mod cannot satisfy (upstream's
+// version number is kept deliberately), so the same upstream call is exposed here.
+- (void)appHideStageUpdate
+{
+    DOAppHideTrace(@"stage update tapped");
+
+    DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
+    if (![envManager isJailbroken]) {
+        [self appHideAlertWithTitle:@"需要先越狱"
+                           message:@"当前没有检测到越狱环境，写入 basebin 会失败。先在首页完成越狱，再回到这里点一次。"];
+        return;
+    }
+
+    NSError *error = nil;
+    @try {
+        error = [envManager updateEnvironment];
+    } @catch (NSException *e) {
+        DOAppHideTrace([@"stage update threw: " stringByAppendingString:e.reason ?: @"?"]);
+        [self appHideAlertWithTitle:@"重装失败"
+                           message:[NSString stringWithFormat:@"写入时抛异常：%@", e.reason ?: @"未知"]];
+        return;
+    }
+
+    DOAppHideTrace([NSString stringWithFormat:@"stage update: %@",
+                    error ? error.description : @"staged, userspace reboot requested"]);
+    if (error) {
+        [self appHideAlertWithTitle:@"重装失败"
+                           message:[NSString stringWithFormat:
+                                    @"%@（错误码 %ld）\n先确认首页显示已越狱，然后重试。",
+                                    error.localizedDescription ?: @"未知错误", (long)error.code]];
+    }
+    // Success path needs no alert: updateEnvironment asks for a userspace reboot itself.
+}
+
+- (void)appHideAlertWithTitle:(NSString *)title message:(NSString *)message
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                       message:message
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 #pragma mark - switch handlers
