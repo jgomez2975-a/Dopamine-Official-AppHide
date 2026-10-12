@@ -11,7 +11,7 @@
 // Version of the panel code itself, shown in the first row. The engine inside the
 // basebin has its own version (it logs "engine vN"), and keeping them visible together
 // is how "the app updated but the basebin did not" stops being invisible.
-#define APP_HIDE_PANEL_VERSION @"v8"
+#define APP_HIDE_PANEL_VERSION @"v9"
 
 // Name matching for the search field. Substring first, then subsequence, so the
 // short forms people actually type still find the app: "农行" -> 中国农业银行
@@ -41,12 +41,17 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     return YES;
 }
 
-@interface DOAppHideController () <UISearchBarDelegate>
+@interface DOAppHideController () <UISearchBarDelegate, UISearchResultsUpdating>
 // Built once per screen load, then filtered. Every app block is two switch
 // specifiers plus its group header, so the filter works on whole blocks.
 @property (nonatomic, strong) NSArray<PSSpecifier *> *appHideAllSpecifiers;
 @property (nonatomic, strong) UISearchBar *appHideSearchBar;
 @property (nonatomic, copy) NSString *appHideQuery;
+
+- (NSArray<PSSpecifier *> *)appHideBuildAllSpecifiers;
+- (NSArray<PSSpecifier *> *)appHideFilteredSpecifiers;
+- (void)appHideInstallSearchBar;
+- (void)appHideApplyQuery:(NSString *)text;
 @end
 
 @implementation DOAppHideController
@@ -69,8 +74,12 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     // Re-read the rules file every time the panel is entered: the file is the
     // single source of truth, and it lives outside the container.
     [[DOEnvironmentManager sharedManager] appHideInvalidateRulesCache];
+    // Only the mod's own cache is dropped. `_specifiers` (PSListController's ivar) is
+    // NEVER touched: it has companion index maps that are not public, so nil-ing the
+    // array alone leaves them pointing at the previous specifier objects and the next
+    // table reload dies. That single line was the difference between v4, which ran, and
+    // v5-v8, which crashed as soon as the panel was opened.
     self.appHideAllSpecifiers = nil;
-    _specifiers = nil;
     [self appHideInstallSearchBar];
 }
 
@@ -78,38 +87,46 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 
 - (void)appHideInstallSearchBar
 {
-    // A search bar must never be able to take the panel down, and the table really can
-    // be nil this early in the lifecycle.
     @try {
-        UITableView *table = (UITableView *)self.table;   // PSListController declares `table` as id
-        if (!table) return;
+        if (self.appHideSearchBar) return;
 
-        if (!self.appHideSearchBar) {
-            UISearchBar *bar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, table.bounds.size.width, 44)];
-            bar.delegate = self;
-            bar.placeholder = @"搜索 App 名称或 Bundle ID（如 农行 / abchina）";
-            bar.autocapitalizationType = UITextAutocapitalizationTypeNone;
-            bar.autocorrectionType = UITextAutocorrectionTypeNo;
-            bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-            bar.searchBarStyle = UISearchBarStyleMinimal;
-            self.appHideSearchBar = bar;
-        }
-        if (table.tableHeaderView != self.appHideSearchBar) {
-            table.tableHeaderView = self.appHideSearchBar;
-        }
+        // Navigation bar only. A search bar installed as the table's header view has to
+        // cooperate with PSListController's own table handling, and this panel's job is
+        // to be boringly reliable.
+        UISearchController *controller = [[UISearchController alloc] initWithSearchResultsController:nil];
+        controller.obscuresBackgroundDuringPresentation = NO;
+        controller.searchResultsUpdater = self;
+        controller.searchBar.placeholder = @"搜索 App 名称或 Bundle ID（如 农行 / abchina）";
+        controller.searchBar.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        controller.searchBar.autocorrectionType = UITextAutocorrectionTypeNo;
+
+        self.definesPresentationContext = YES;
+        self.navigationItem.searchController = controller;
+        self.navigationItem.hidesSearchBarWhenScrolling = NO;
+        self.appHideSearchBar = controller.searchBar;
     } @catch (NSException *e) {
         DOAppHideTrace([@"search bar failed: " stringByAppendingString:e.reason ?: @"?"]);
     }
 }
 
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController
+{
+    [self appHideApplyQuery:searchController.searchBar.text];
+}
+
 - (void)searchBar:(UISearchBar *)searchBar textDidChange:(NSString *)searchText
 {
-    NSString *trimmed = [searchText stringByTrimmingCharactersInSet:
+    [self appHideApplyQuery:searchText];
+}
+
+- (void)appHideApplyQuery:(NSString *)text
+{
+    NSString *trimmed = [text stringByTrimmingCharactersInSet:
                          [NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if ([trimmed isEqualToString:self.appHideQuery ?: @""]) return;
     self.appHideQuery = trimmed;
-    // Drop the cache so PSListController asks for the filtered list.
-    _specifiers = nil;
+    DOAppHideTrace([NSString stringWithFormat:@"search: %@", trimmed]);
+    // reloadSpecifiers re-asks this controller for its list; the ivar stays untouched.
     [self reloadSpecifiers];
 }
 
@@ -122,22 +139,20 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 
 - (NSArray *)specifiers
 {
-    if (!_specifiers) {
-        // Last line of defence: building the list talks to jbclient and walks every
-        // installed bundle, and a failure in there must degrade to a readable row
-        // rather than take the app down.
-        @try {
-            _specifiers = [self appHideFilteredSpecifiers];
-        } @catch (NSException *e) {
-            DOAppHideTrace([@"specifiers failed: " stringByAppendingString:e.reason ?: @"?"]);
-            PSSpecifier *group = [PSSpecifier emptyGroupSpecifier];
-            group.name = @"App Hiding";
-            [group setProperty:[NSString stringWithFormat:@"面板加载失败：%@", e.reason ?: @"未知异常"]
-                        forKey:@"footerText"];
-            _specifiers = @[group];
-        }
+    // Recomputed on every ask (the expensive part is cached inside
+    // appHideBuildAllSpecifiers) and never stored into PSListController's own ivar: that
+    // array has companion index maps which are not public, so writing it by hand is how
+    // the panel used to kill itself.
+    @try {
+        return [self appHideFilteredSpecifiers];
+    } @catch (NSException *e) {
+        DOAppHideTrace([@"specifiers failed: " stringByAppendingString:e.reason ?: @"?"]);
+        PSSpecifier *group = [PSSpecifier emptyGroupSpecifier];
+        group.name = @"App Hiding";
+        [group setProperty:[NSString stringWithFormat:@"面板加载失败：%@", e.reason ?: @"未知异常"]
+                    forKey:@"footerText"];
+        return @[group];
     }
-    return _specifiers;
 }
 
 - (NSArray<PSSpecifier *> *)appHideBuildAllSpecifiers

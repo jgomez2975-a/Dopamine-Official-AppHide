@@ -267,9 +267,14 @@
             [specifiers addObject:jetsamSpecifier];
 
             PSSpecifier *appHidingGroupSpecifier = [PSSpecifier emptyGroupSpecifier];
-            appHidingGroupSpecifier.name = @"App Hiding";
+            // The version is on this row on purpose: "did the new package actually land"
+            // has to be answerable from the first settings screen, without opening the
+            // panel - earlier builds carried no version anywhere and that cost a whole
+            // round trip.
+            appHidingGroupSpecifier.name = @"App Hiding (AppHide v9)";
             [appHidingGroupSpecifier setProperty:@"Per-app jailbreak hiding. Rules are written to "
-                                                 @"/var/mobile/Library/Preferences/.DopamineAppHideRules.plist as root."
+                                                 @"/var/mobile/Library/Preferences/.DopamineAppHideRules.plist as root. "
+                                                 @"Open Hidden Apps for the basebin self check."
                                           forKey:@"footerText"];
             [specifiers addObject:appHidingGroupSpecifier];
 
