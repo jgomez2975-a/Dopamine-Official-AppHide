@@ -187,6 +187,71 @@ static char *app_hide_bundle_id_for_executable(const char *path)
 }
 // ==== end App Hide ==========================================================
 
+// Launchd does not spawn an app directly: it spawns /usr/libexec/xpcproxy with the app's
+// launchd label as argv[1] ("application.<bundle id>" plus a version dependent tail). The
+// executable path therefore names xpcproxy and cannot yield a bundle id, which is why the
+// rules lookup never matched for a home screen launch. The label's tail is not stable across
+// iOS versions, so the bundle id is taken from the rules file itself: the longest key that
+// the label starts with wins.
+static char *app_hide_rules_key_prefix(const char *label)
+{
+	if (!label) return NULL;
+	if (access(APP_HIDE_RULES_PATH, R_OK) != 0) return NULL;
+
+	xpc_object_t rulesDict = xpc_object_from_plist(APP_HIDE_RULES_PATH);
+	if (!rulesDict) return NULL;
+	if (xpc_get_type(rulesDict) != XPC_TYPE_DICTIONARY) { xpc_release(rulesDict); return NULL; }
+
+	__block const char *bestKey = NULL;
+	__block size_t bestLen = 0;
+	xpc_dictionary_apply(rulesDict, ^bool(const char *key, xpc_object_t value) {
+		size_t len = strlen(key);
+		if (len > bestLen && strncmp(label, key, len) == 0) {
+			bestKey = key;
+			bestLen = len;
+		}
+		return true;
+	});
+
+	char *result = bestKey ? strdup(bestKey) : NULL;
+	xpc_release(rulesDict);
+	return result;
+}
+
+static char *app_hide_bundle_id_for_spawn_label(const char *label)
+{
+	if (!label) return NULL;
+	if (strncmp(label, "application.", strlen("application.")) == 0) {
+		label += strlen("application.");
+	}
+	return app_hide_rules_key_prefix(label);
+}
+
+// Every spawn decision is appended here. launchd writes it (root, unsandboxed), which is the
+// side that matters: it proves whether a given app was matched by the rules at launch time.
+// A sandboxed process cannot open the file; that failure is harmless and repeated once per
+// spawn from launchd anyway.
+#define APP_HIDE_SPAWN_LOG_PATH "/var/mobile/Library/Preferences/.DopamineAppHide.spawn.log"
+
+static void app_hide_spawn_note(const char *target, const char *bundleID, const char *label,
+                                bool hide, bool noInject)
+{
+	int fd = open(APP_HIDE_SPAWN_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND, 0644);
+	if (fd < 0) return;
+
+	struct stat st;
+	if (fstat(fd, &st) == 0 && st.st_size < 256 * 1024) {
+		char line[1024];
+		int n = snprintf(line, sizeof(line), "%s -> id=%s label=%s hide=%d noinject=%d\n",
+		                 target ? target : "?",
+		                 bundleID ? bundleID : "(no match)",
+		                 label ? label : "-",
+		                 hide ? 1 : 0, noInject ? 1 : 0);
+		if (n > 0) (void)write(fd, line, (size_t)n);
+	}
+	close(fd);
+}
+
 static kSpawnConfig spawn_config_for_executable(const char* path, char *const argv[restrict])
 {
 	// Blacklist to ensure general system stability
@@ -240,10 +305,20 @@ static int spawn_exec_hook_common(bool isExec,
 
 	kSpawnConfig spawnConfig = spawn_config_for_executable(path, argv);
 	char *appHideBundleID = app_hide_bundle_id_for_executable(path);
+	const char *appHideSpawnLabel = (argv && argv[1]) ? argv[1] : NULL;
+	if (!appHideBundleID) {
+		// Not a /Bundle/Application/ path: this is launchd spawning the app through
+		// xpcproxy, so the target only appears in argv[1]. Without this branch no
+		// home screen launch was ever matched by the rules.
+		appHideBundleID = app_hide_bundle_id_for_spawn_label(appHideSpawnLabel);
+	}
 	bool appHideNoInject = false;
 	bool shouldHideAppEnv = appHideBundleID
 	                      ? app_hide_rules_for_bundle_id(appHideBundleID, &appHideNoInject)
 	                      : false;
+	if (strstr(path ? path : "", "xpcproxy") || appHideBundleID) {
+		app_hide_spawn_note(path, appHideBundleID, appHideSpawnLabel, shouldHideAppEnv, appHideNoInject);
+	}
 	if (appHideBundleID) free(appHideBundleID);
 
 	if (spawnConfig & kSpawnConfigTrust) {

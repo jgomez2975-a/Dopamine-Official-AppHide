@@ -194,11 +194,14 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
         NSString *root = @"/var/jb";
         if (![[NSFileManager defaultManager] fileExistsAtPath:root]) root = @"/";
 
-        // engine v9 / 8 byte thunk hook only exist in a build that carries the short-hook
-        // path, so a clean systemhook cannot fake them.
+        // engine v10 / 8 byte thunk hook / the spawn decision log only exist in a build
+        // that carries the short-hook path and the xpcproxy-aware rules lookup, so a
+        // clean systemhook cannot fake them.
         NSArray<NSString *> *markers = @[@"app_hide_install", @"canOpenURL",
-                                        @".DopamineAppHideRules.plist", @"engine v9",
-                                        @"8 byte thunk hook"];
+                                        @".DopamineAppHideRules.plist", @"engine v10",
+                                        @"8 byte thunk hook",
+                                        @".DopamineAppHide.spawn.log",
+                                        @"hide=%d noinject=%d"];
         markerTotal = markers.count;
         if (markerTotal == 0) markerTotal = 1;   // never divide by zero
 
@@ -228,6 +231,42 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
         [lines addObject:launchdhook.length
             ? @"launchdhook.dylib：原版（本 mod 不改它，属正常，不影响判定）"
             : @"launchdhook.dylib：读不到"];
+
+        // The rules file and the launch-time decisions. These separate "the app was never
+        // matched by the rules" from "it was matched and something else is still visible".
+        // Both are read as root - a sandboxed app cannot see either file.
+        NSString *rulesPath = @"/var/mobile/Library/Preferences/.DopamineAppHideRules.plist";
+        NSDictionary *rules = [NSDictionary dictionaryWithContentsOfFile:rulesPath];
+        if (rules.count) {
+            NSMutableArray<NSString *> *ruleLines = [NSMutableArray new];
+            for (NSString *key in [rules.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+                id entry = rules[key];
+                BOOL hide = [entry isKindOfClass:[NSDictionary class]] ? [entry[@"HideEnvironment"] boolValue] : NO;
+                BOOL noInject = [entry isKindOfClass:[NSDictionary class]] ? [entry[@"HideNoInject"] boolValue] : NO;
+                [ruleLines addObject:[NSString stringWithFormat:@"  %@  hide=%d noinject=%d",
+                                      key, hide ? 1 : 0, noInject ? 1 : 0]];
+            }
+            [lines addObject:[NSString stringWithFormat:@"规则文件：%lu 条\n%@",
+                              (unsigned long)rules.count, [ruleLines componentsJoinedByString:@"\n"]]];
+        } else {
+            [lines addObject:@"规则文件：读不到或为空（开关没写进 .DopamineAppHideRules.plist）"];
+        }
+
+        NSString *spawnLogPath = @"/var/mobile/Library/Preferences/.DopamineAppHide.spawn.log";
+        NSData *spawnData = [NSData dataWithContentsOfFile:spawnLogPath];
+        if (spawnData.length) {
+            NSString *spawnText = [[NSString alloc] initWithData:spawnData encoding:NSUTF8StringEncoding];
+            NSArray<NSString *> *spawnLines = [spawnText componentsSeparatedByString:@"\n"];
+            NSUInteger from = spawnLines.count > 13 ? spawnLines.count - 13 : 0;
+            NSMutableArray<NSString *> *logTail = [NSMutableArray new];
+            for (NSUInteger i = from; i < spawnLines.count; i++) {
+                if (spawnLines[i].length) [logTail addObject:spawnLines[i]];
+            }
+            [lines addObject:[NSString stringWithFormat:@"启动判定（最近 %lu 条）：\n%@",
+                              (unsigned long)logTail.count, [logTail componentsJoinedByString:@"\n"]]];
+        } else {
+            [lines addObject:@"启动判定日志：还没有（装完这版后启动任意 App 再回来看）"];
+        }
 
         result = [lines componentsJoinedByString:@"\n"];
     }];

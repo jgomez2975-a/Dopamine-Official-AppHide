@@ -1067,7 +1067,7 @@ static void app_hide_setup_objc(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v9"
+#define APP_HIDE_ENGINE_VERSION "v10"
 
 typedef struct {
 	const char *name;
