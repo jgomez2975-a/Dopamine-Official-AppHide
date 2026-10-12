@@ -591,22 +591,33 @@ static int app_hide_getattrlist(const char *path, void *attrList, void *attrBuf,
 			(const void *)(unsigned long)&replacee,                                \
 		}
 
-// The five the patch guard refuses, plus the rest of the path-taking face of the engine so that
-// the plain filesystem view is complete even with the advanced hook set switched off.
+// v19: the list is deliberately short, and that is a device finding rather than a preference.
 //
-// Only handlers that (a) pass through with a raw syscall or an *at() sibling and (b) gate on
-// app_hide_hidden_path() before deviating are listed here. fork/ptrace/sysctl/getfsstat are
-// deliberately absent: they deviate unconditionally (fork always returns EPERM), which is correct
-// when the engine is installed only inside a hidden process and wrong the moment the hook is
-// global - interposing those would break fork and process listing for every process on the
-// device. They stay in the advanced set, installed per app.
+// engine v17/v18 interposed thirteen entry points and took assetsd and misagent down with them:
+// both aborted in a loop within seconds of the install (their crash reports appear only in that
+// window and nowhere in the 175 reports that came before it), while the app-level crash fix held
+// throughout. What separates the entries that survived on the device from the ones that did not is
+// the pass-through:
+//
+//   stat -> fstatat -> raw SYS_fstatat          a 1:1 mapping of the call the libc wrapper itself
+//   lstat -> fstatat                            makes, and each syscall number is proved live by
+//   access -> faccessat -> raw SYS_faccessat    app_hide_syscall_ready() before it is installed
+//   readlink -> readlinkat -> raw SYS_readlinkat
+//   open -> openat -> raw SYS_openat
+//
+//   fopen, opendir       reimplementations (mode-string parsing, DIR construction). A small
+//   statfs, getattrlist  deviation is invisible inside a hidden app and fatal in a daemon that
+//                        everything else depends on; statfs/getattrlist also re-issue a raw
+//                        syscall whose struct layout and buffer conventions are not guaranteed to
+//                        match the libc wrapper whose result the caller parses.
+//
+// Anything that is not a faithful passthrough stays where it was before v23: an aggressive-mode
+// hook, installed with litehook inside a hidden process only, where a deviation is contained.
 APP_HIDE_INTERPOSE(app_hide_stat,      stat);
 APP_HIDE_INTERPOSE(app_hide_lstat,     lstat);
 APP_HIDE_INTERPOSE(app_hide_access,    access);
 APP_HIDE_INTERPOSE(app_hide_readlink,  readlink);
-APP_HIDE_INTERPOSE(app_hide_opendir,   opendir);
 APP_HIDE_INTERPOSE(app_hide_open,      open);
-APP_HIDE_INTERPOSE(app_hide_fopen,     fopen);
 // The *at() family: several SDKs call fstatat/openat directly and never touch the wrappers above,
 // so leaving these out would leave the same hole one level down. Guarded exactly like the
 // definitions, so a toolchain without the syscall number cannot produce a dangling reference.
@@ -622,9 +633,6 @@ APP_HIDE_INTERPOSE(app_hide_openat,    openat);
 #ifdef SYS_readlinkat
 APP_HIDE_INTERPOSE(app_hide_readlinkat, readlinkat);
 #endif
-// Filesystem and attribute queries the path hooks above cannot cover.
-APP_HIDE_INTERPOSE(app_hide_statfs,    statfs);
-APP_HIDE_INTERPOSE(app_hide_getattrlist, getattrlist);
 
 #pragma mark - hooks without a usable sibling (raw syscall passthrough)
 
@@ -1255,7 +1263,7 @@ static void app_hide_register_image_callback(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v18"
+#define APP_HIDE_ENGINE_VERSION "v19"
 
 typedef struct {
 	const char *name;
