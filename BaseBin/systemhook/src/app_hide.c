@@ -769,10 +769,12 @@ static bool app_hide_is_jb_url(app_hide_id url)
 	return false;
 }
 
-static BOOL app_hide_can_open_url_hook(app_hide_id self, app_hide_sel_t _cmd, app_hide_id url)
+// Plain C here: BOOL/YES/NO do not exist, and on arm64 -[UIApplication canOpenURL:]
+// is declared BOOL, which is `bool` in the arm64 ABI - so the return type matches.
+static bool app_hide_can_open_url_hook(app_hide_id self, app_hide_sel_t _cmd, app_hide_id url)
 {
-	if (app_hide_is_jb_url(url)) return NO;
-	return ((BOOL (*)(app_hide_id, app_hide_sel_t, app_hide_id))gOrigCanOpenURL)(self, _cmd, url);
+	if (app_hide_is_jb_url(url)) return false;
+	return ((bool (*)(app_hide_id, app_hide_sel_t, app_hide_id))gOrigCanOpenURL)(self, _cmd, url);
 }
 
 static void app_hide_install_app_list_hooks(void)
