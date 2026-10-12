@@ -345,6 +345,16 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
         for (NSUInteger j = start; j < end; j++) [filtered addObject:all[j]];
     }
 
+    // Header plus the two action rows only means "nothing matched": say so, or an empty
+    // screen after typing reads as a broken panel.
+    if (filtered.count <= 3) {
+        PSSpecifier *emptyGroup = [PSSpecifier emptyGroupSpecifier];
+        emptyGroup.name = @"没有匹配的 App";
+        [emptyGroup setProperty:[NSString stringWithFormat:@"没有 App 名称或 Bundle ID 匹配“%@”。", query]
+                        forKey:@"footerText"];
+        [filtered addObject:emptyGroup];
+    }
+
     return filtered;
 }
 
