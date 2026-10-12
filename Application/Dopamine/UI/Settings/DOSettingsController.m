@@ -271,7 +271,7 @@
             // has to be answerable from the first settings screen, without opening the
             // panel - earlier builds carried no version anywhere and that cost a whole
             // round trip.
-            appHidingGroupSpecifier.name = @"App Hiding (AppHide v9)";
+            appHidingGroupSpecifier.name = @"App Hiding (AppHide v10)";
             [appHidingGroupSpecifier setProperty:@"Per-app jailbreak hiding. Rules are written to "
                                                  @"/var/mobile/Library/Preferences/.DopamineAppHideRules.plist as root. "
                                                  @"Open Hidden Apps for the basebin self check."

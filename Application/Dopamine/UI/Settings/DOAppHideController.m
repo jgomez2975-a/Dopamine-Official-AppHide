@@ -11,7 +11,7 @@
 // Version of the panel code itself, shown in the first row. The engine inside the
 // basebin has its own version (it logs "engine vN"), and keeping them visible together
 // is how "the app updated but the basebin did not" stops being invisible.
-#define APP_HIDE_PANEL_VERSION @"v9"
+#define APP_HIDE_PANEL_VERSION @"v10"
 
 // Name matching for the search field. Substring first, then subsequence, so the
 // short forms people actually type still find the app: "农行" -> 中国农业银行
@@ -49,7 +49,8 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 @property (nonatomic, copy) NSString *appHideQuery;
 
 - (NSArray<PSSpecifier *> *)appHideBuildAllSpecifiers;
-- (NSArray<PSSpecifier *> *)appHideFilteredSpecifiers;
+- (NSArray<PSSpecifier *> *)appHideCurrentList;
+- (NSArray<PSSpecifier *> *)appHideFilter:(NSArray<PSSpecifier *> *)all query:(NSString *)query;
 - (void)appHideInstallSearchBar;
 - (void)appHideApplyQuery:(NSString *)text;
 @end
@@ -74,12 +75,12 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     // Re-read the rules file every time the panel is entered: the file is the
     // single source of truth, and it lives outside the container.
     [[DOEnvironmentManager sharedManager] appHideInvalidateRulesCache];
-    // Only the mod's own cache is dropped. `_specifiers` (PSListController's ivar) is
-    // NEVER touched: it has companion index maps that are not public, so nil-ing the
-    // array alone leaves them pointing at the previous specifier objects and the next
-    // table reload dies. That single line was the difference between v4, which ran, and
-    // v5-v8, which crashed as soon as the panel was opened.
+    // Rebuild in place and hand the base class a consistent pair. Leaving `_specifiers`
+    // nil here (v5-v8) crashed the panel; leaving it untouched and unfiltered (v9) left it
+    // empty. Assign, then let reloadSpecifiers redo the index maps.
     self.appHideAllSpecifiers = nil;
+    _specifiers = [self appHideCurrentList];
+    [self reloadSpecifiers];
     [self appHideInstallSearchBar];
 }
 
@@ -126,7 +127,9 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     if ([trimmed isEqualToString:self.appHideQuery ?: @""]) return;
     self.appHideQuery = trimmed;
     DOAppHideTrace([NSString stringWithFormat:@"search: %@", trimmed]);
-    // reloadSpecifiers re-asks this controller for its list; the ivar stays untouched.
+    // Assign the new list first, then ask for a reload: the base class rebuilds its index
+    // maps from whatever `_specifiers` holds, so it must never see nil.
+    _specifiers = [self appHideCurrentList];
     [self reloadSpecifiers];
 }
 
@@ -137,22 +140,29 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 
 #pragma mark - specifiers
 
+// PSListController keeps its own `_specifiers` array and a set of non-public index maps
+// built from it. Two rules follow, and both of them were learned the hard way:
+//   * build into `_specifiers` (the stock pattern) - leaving it nil while the table
+//     reloads is what crashed the panel in v5-v8;
+//   * never leave it nil at any point: whenever it is rebuilt, the rebuild is followed
+//     immediately by -reloadSpecifiers so the index maps are redone alongside it.
+// v9 read the first rule as "never touch the ivar at all", which is why the panel came
+// back alive and empty: the base class had nothing to render.
 - (NSArray *)specifiers
 {
-    // Recomputed on every ask (the expensive part is cached inside
-    // appHideBuildAllSpecifiers) and never stored into PSListController's own ivar: that
-    // array has companion index maps which are not public, so writing it by hand is how
-    // the panel used to kill itself.
-    @try {
-        return [self appHideFilteredSpecifiers];
-    } @catch (NSException *e) {
-        DOAppHideTrace([@"specifiers failed: " stringByAppendingString:e.reason ?: @"?"]);
-        PSSpecifier *group = [PSSpecifier emptyGroupSpecifier];
-        group.name = @"App Hiding";
-        [group setProperty:[NSString stringWithFormat:@"面板加载失败：%@", e.reason ?: @"未知异常"]
-                    forKey:@"footerText"];
-        return @[group];
+    if (!_specifiers) {
+        _specifiers = [self appHideCurrentList];
     }
+    return _specifiers;
+}
+
+// Always returns at least the header plus the two action rows, so a failure further down
+// produces a readable panel instead of a blank screen.
+- (NSArray<PSSpecifier *> *)appHideCurrentList
+{
+    NSArray<PSSpecifier *> *all = [self appHideBuildAllSpecifiers];
+    if (self.appHideQuery.length == 0) return all;
+    return [self appHideFilter:all query:self.appHideQuery];
 }
 
 - (NSArray<PSSpecifier *> *)appHideBuildAllSpecifiers
@@ -164,12 +174,13 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     NSMutableArray<PSSpecifier *> *specifiers = [NSMutableArray new];
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
 
-    NSArray<NSDictionary *> *apps = [envManager appHideInstalledApps];
-    DOAppHideTrace([NSString stringWithFormat:@"specifiers: %lu installed apps", (unsigned long)apps.count]);
-
-    NSUInteger hiddenCount = 0;
-    for (NSDictionary *app in apps) {
-        if ([envManager isEnvironmentHiddenForBundleID:app[@"bundleID"]]) hiddenCount++;
+    // Rows that depend on nothing else go in first: even if the app list below fails, the
+    // panel still shows a title, the self check and the export row.
+    NSString *verdict = @"未知";
+    @try {
+        verdict = [envManager appHideBasebinVerdict];
+    } @catch (NSException *e) {
+        DOAppHideTrace([@"self check failed: " stringByAppendingString:e.reason ?: @"?"]);
     }
 
     PSSpecifier *headerGroup = [PSSpecifier emptyGroupSpecifier];
@@ -177,12 +188,7 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     // grey small print that gets truncated, and the user reported exactly that - the
     // self check was there and could not be seen.
     headerGroup.name = [NSString stringWithFormat:@"App Hiding %@ — basebin %@",
-                        APP_HIDE_PANEL_VERSION, [envManager appHideBasebinVerdict]];
-    [headerGroup setProperty:[NSString stringWithFormat:
-                                 @"共 %lu 个 App，已隐藏 %lu 个。隐藏的 App 启动时不会带上越狱环境，改完下次启动生效（不用注销）。\n%@",
-                                 (unsigned long)apps.count, (unsigned long)hiddenCount,
-                                 [envManager appHideDiagnostics]]
-                     forKey:@"footerText"];
+                        APP_HIDE_PANEL_VERSION, verdict];
     [specifiers addObject:headerGroup];
 
     // Environment self check as its own row: tap to see which basebin is really
@@ -213,60 +219,108 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     [exportSpecifier setProperty:NSStringFromSelector(@selector(appHideExportLogs)) forKey:@"action"];
     [specifiers addObject:exportSpecifier];
 
-    for (NSDictionary *app in apps) {
-        NSString *bundleID = app[@"bundleID"];
+    // The app list is the one part that depends on the jailbreak being up (it escalates to
+    // root and reads the container layout). It is isolated: on failure the panel keeps the
+    // three rows above and gains a row that says what went wrong, instead of going blank.
+    NSUInteger appCount = 0;
+    NSUInteger hiddenCount = 0;
+    NSString *listNote = nil;
 
-        PSSpecifier *appGroup = [PSSpecifier emptyGroupSpecifier];
-        appGroup.name = app[@"name"];
-        [appGroup setProperty:bundleID forKey:@"footerText"];
-        // Tag every row of an app block with its bundle id: the search filter groups
-        // rows by this instead of by position, so extra rows (the export button above)
-        // cannot shift the blocks apart.
-        [appGroup setProperty:bundleID forKey:@"appHideBundleID"];
-        [specifiers addObject:appGroup];
+    @try {
+        NSArray<NSDictionary *> *apps = [envManager appHideInstalledApps];
+        appCount = apps.count;
+        DOAppHideTrace([NSString stringWithFormat:@"specifiers: %lu installed apps", (unsigned long)appCount]);
 
-        PSSpecifier *hideSpecifier = [PSSpecifier preferenceSpecifierNamed:@"Hide Jailbreak Environment"
-                                                                   target:self
-                                                                      set:@selector(setHidden:specifier:)
-                                                                      get:@selector(readHidden:)
-                                                                   detail:nil
-                                                                     cell:PSSwitchCell
-                                                                     edit:nil];
-        [hideSpecifier setProperty:@YES forKey:@"enabled"];
-        [hideSpecifier setProperty:bundleID forKey:@"bundleID"];
-        [hideSpecifier setProperty:bundleID forKey:@"appHideBundleID"];
-        [hideSpecifier setProperty:@NO forKey:@"default"];
-        [specifiers addObject:hideSpecifier];
+        for (NSDictionary *app in apps) {
+            NSString *bundleID = app[@"bundleID"];
 
-        PSSpecifier *noInjectSpecifier = [PSSpecifier preferenceSpecifierNamed:@"No Injection"
+            BOOL alreadyHidden = [envManager isEnvironmentHiddenForBundleID:bundleID];
+            if (alreadyHidden) hiddenCount++;
+
+            PSSpecifier *appGroup = [PSSpecifier emptyGroupSpecifier];
+            appGroup.name = app[@"name"];
+            [appGroup setProperty:bundleID forKey:@"footerText"];
+            // Tag every row of an app block with its bundle id: the search filter groups
+            // rows by this instead of by position, so extra rows (the buttons above)
+            // cannot shift the blocks apart.
+            [appGroup setProperty:bundleID forKey:@"appHideBundleID"];
+            [specifiers addObject:appGroup];
+
+            PSSpecifier *hideSpecifier = [PSSpecifier preferenceSpecifierNamed:(alreadyHidden ? @"Hide Jailbreak Environment ✅" : @"Hide Jailbreak Environment")
                                                                        target:self
-                                                                          set:@selector(setNoInject:specifier:)
-                                                                          get:@selector(readNoInject:)
+                                                                          set:@selector(setHidden:specifier:)
+                                                                          get:@selector(readHidden:)
                                                                        detail:nil
                                                                          cell:PSSwitchCell
                                                                          edit:nil];
-        [noInjectSpecifier setProperty:@YES forKey:@"enabled"];
-        [noInjectSpecifier setProperty:bundleID forKey:@"bundleID"];
-        [noInjectSpecifier setProperty:bundleID forKey:@"appHideBundleID"];
-        [noInjectSpecifier setProperty:@NO forKey:@"default"];
-        [specifiers addObject:noInjectSpecifier];
+            [hideSpecifier setProperty:@YES forKey:@"enabled"];
+            [hideSpecifier setProperty:bundleID forKey:@"bundleID"];
+            [hideSpecifier setProperty:bundleID forKey:@"appHideBundleID"];
+            [hideSpecifier setProperty:@NO forKey:@"default"];
+            [specifiers addObject:hideSpecifier];
+
+            PSSpecifier *noInjectSpecifier = [PSSpecifier preferenceSpecifierNamed:@"No Injection"
+                                                                           target:self
+                                                                              set:@selector(setNoInject:specifier:)
+                                                                              get:@selector(readNoInject:)
+                                                                           detail:nil
+                                                                             cell:PSSwitchCell
+                                                                             edit:nil];
+            [noInjectSpecifier setProperty:@YES forKey:@"enabled"];
+            [noInjectSpecifier setProperty:bundleID forKey:@"bundleID"];
+            [noInjectSpecifier setProperty:bundleID forKey:@"appHideBundleID"];
+            [noInjectSpecifier setProperty:@NO forKey:@"default"];
+            [specifiers addObject:noInjectSpecifier];
+        }
+    } @catch (NSException *e) {
+        listNote = [NSString stringWithFormat:@"读取 App 列表失败：%@", e.reason ?: @"未知异常"];
+        DOAppHideTrace([@"app list failed: " stringByAppendingString:e.reason ?: @"?"]);
+
+        PSSpecifier *failGroup = [PSSpecifier emptyGroupSpecifier];
+        failGroup.name = @"App 列表读取失败";
+        [failGroup setProperty:listNote forKey:@"footerText"];
+        [specifiers addObject:failGroup];
     }
+
+    if (appCount == 0 && !listNote) {
+        listNote = @"没有读到已安装的 App（先越狱，并在 Dopamine 首页点一次 Update Environment）";
+
+        // A row, not just footer text: an empty panel with an explanation buried in grey
+        // print reads as a broken panel, which is exactly the report that produced v10.
+        PSSpecifier *emptyGroup = [PSSpecifier emptyGroupSpecifier];
+        emptyGroup.name = @"没有读到 App 列表";
+        [emptyGroup setProperty:listNote forKey:@"footerText"];
+        [specifiers addObject:emptyGroup];
+    }
+
+    NSString *summary = nil;
+    @try {
+        summary = [envManager appHideDiagnostics];
+    } @catch (NSException *e) {
+        summary = [NSString stringWithFormat:@"诊断信息读取失败：%@", e.reason ?: @"未知异常"];
+    }
+
+    [headerGroup setProperty:[NSString stringWithFormat:
+                              @"共 %lu 个 App，已隐藏 %lu 个%@。隐藏的 App 启动时不会带上越狱环境，改完下次启动生效（不用注销）。\n%@",
+                              (unsigned long)appCount, (unsigned long)hiddenCount,
+                              listNote ? [NSString stringWithFormat:@"（%@）", listNote] : @"",
+                              summary ?: @""]
+                     forKey:@"footerText"];
 
     self.appHideAllSpecifiers = specifiers;
     return specifiers;
 }
 
-- (NSArray<PSSpecifier *> *)appHideFilteredSpecifiers
+- (NSArray<PSSpecifier *> *)appHideFilter:(NSArray<PSSpecifier *> *)all query:(NSString *)query
 {
-    NSArray<PSSpecifier *> *all = [self appHideBuildAllSpecifiers];
-    NSString *query = self.appHideQuery;
     if (query.length == 0) return all;
 
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
     NSMutableArray<PSSpecifier *> *filtered = [NSMutableArray new];
 
-    // Rows are grouped by the bundle id they carry, not by their position: the header
-    // and the export row are added without one, so no extra row can shift the blocks.
+    // Rows are grouped by the bundle id they carry, not by their position: the header,
+    // the two buttons and the empty-state row are added without one, so no extra row can
+    // shift the blocks apart.
     NSUInteger i = 0;
     while (i < all.count) {
         PSSpecifier *specifier = all[i];
@@ -291,13 +345,6 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
         for (NSUInteger j = start; j < end; j++) [filtered addObject:all[j]];
     }
 
-    if (filtered.count == 1) {
-        PSSpecifier *emptyGroup = [PSSpecifier emptyGroupSpecifier];
-        emptyGroup.name = @"没有匹配的 App";
-        [emptyGroup setProperty:[NSString stringWithFormat:@"没有 App 名称或 Bundle ID 匹配“%@”。", query]
-                        forKey:@"footerText"];
-        [filtered addObject:emptyGroup];
-    }
     return filtered;
 }
 
