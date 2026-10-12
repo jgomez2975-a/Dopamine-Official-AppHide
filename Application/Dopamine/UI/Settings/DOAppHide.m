@@ -259,6 +259,14 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
             NSMutableArray<NSString *> *containerLines = [NSMutableArray new];
             NSDictionary<NSString *, NSString *> *paths = [self appHideInstalledAppsByBundleID];
             NSFileManager *rfm2 = [NSFileManager defaultManager];
+            // If the scan sees no containers at all, every per-app line below would be a
+            // lie: it would read "engine never ran" when the truth is "the panel cannot
+            // read the container directory". Say which one it is.
+            NSArray *containerScan = [rfm2 contentsOfDirectoryAtPath:
+                @"/var/mobile/Containers/Data/Application" error:nil];
+            if (containerScan.count == 0) {
+                [containerLines addObject:@"  （容器目录扫描不到：root+unsandboxed 也读不出 /var/mobile/Containers/Data/Application，下面的 ❌ 不代表 App 没启动）"];
+            }
             for (NSString *key in [rules.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
                 NSString *container = [self appHideContainerPathLocked:key appPath:paths[key]];
                 NSString *caches = container.length ? [container stringByAppendingPathComponent:@"Library/Caches"] : nil;
