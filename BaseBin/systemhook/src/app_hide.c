@@ -748,6 +748,7 @@ static int app_hide_getfsstat64(struct statfs *buf, int bufsize, int flags)
 {
 	return app_hide_getfsstat(buf, bufsize, flags);
 }
+#endif
 
 // ptrace: only PT_DENY_ATTACH is answered locally. Everything else is forwarded as a raw
 // syscall, so a legitimate ptrace call in a hidden app still behaves normally.
