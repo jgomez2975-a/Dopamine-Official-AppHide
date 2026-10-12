@@ -1102,7 +1102,7 @@ static void app_hide_setup_objc(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v14"
+#define APP_HIDE_ENGINE_VERSION "v15"
 
 typedef struct {
 	const char *name;
@@ -1465,18 +1465,15 @@ void app_hide_install(void)
 
 	gAppHideActive = true;
 
-	// Do this before hooking: it uses _dyld_* and the raw Mach-O headers, none of
-	// which goes through the functions we are about to replace.
-	app_hide_hide_image_paths();
-
-	// Every one of these goes through app_hide_hook(), which refuses to touch a
-	// function that litehook's fixed 20 byte patch would spill into its neighbour.
+	// v15: the default set is only what can be re-issued as a raw syscall. fopen/opendir
+	// have no raw syscall equivalent (they build a FILE*/DIR*), and the image path rewrite
+	// edits the recorded names of already loaded images, which a complex app resolves
+	// classes through. Both are in the round 2 set now, off by default - the build that
+	// kept them here is the one that killed the bank app on launch.
 	app_hide_hook("stat",     (void *)stat,     (void *)app_hide_stat);
 	app_hide_hook("lstat",    (void *)lstat,    (void *)app_hide_lstat);
 	app_hide_hook("access",   (void *)access,   (void *)app_hide_access);
 	app_hide_hook("open",     (void *)open,     (void *)app_hide_open);
-	app_hide_hook("fopen",    (void *)fopen,    (void *)app_hide_fopen);
-	app_hide_hook("opendir",  (void *)opendir,  (void *)app_hide_opendir);
 	app_hide_hook("readlink", (void *)readlink, (void *)app_hide_readlink);
 
 	// Round 2: the checks a banking app's hardening SDK reaches for after the
@@ -1485,6 +1482,11 @@ void app_hide_install(void)
 	// be bare syscall thunks, in which case the guard skips them instead of
 	// corrupting the shared cache next door.
 	if (aggressive) {
+		// Moved here in v15: see the note at the default set above.
+		app_hide_hook("fopen",   (void *)fopen,   (void *)app_hide_fopen);
+		app_hide_hook("opendir", (void *)opendir, (void *)app_hide_opendir);
+		app_hide_hide_image_paths();
+
 		app_hide_hook("fork",        (void *)fork,        (void *)app_hide_fork);
 		app_hide_hook("sysctl",      (void *)sysctl,      (void *)app_hide_sysctl);
 		app_hide_hook("statfs",      (void *)statfs,      (void *)app_hide_statfs);
