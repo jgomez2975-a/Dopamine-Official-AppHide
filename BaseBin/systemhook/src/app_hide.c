@@ -538,6 +538,41 @@ static DIR *app_hide_opendir(const char *path)
 static void app_hide_scrub_procargs(char *buffer, size_t length);
 static void app_hide_filter_process_list(void *buffer, size_t *lengthPtr);
 
+
+// sysctlbyname is a separate exported symbol from sysctl, and it is the form most hardening
+// SDKs actually use. Hooking sysctl alone leaves it untouched. There is no original to call
+// through (litehook destroyed the prologue), so it is reimplemented instead: the name is
+// converted to a MIB and the request is handed to the same filter sysctl uses.
+static int app_hide_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+
+static int app_hide_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen)
+{
+	app_hide_tick();
+	if (!name) { errno = EINVAL; return -1; }
+
+	int mib[8];
+	size_t miblen = sizeof(mib) / sizeof(mib[0]);
+	if (sysctlnametomib(name, mib, &miblen) != 0) {
+		errno = ENOENT;
+		return -1;
+	}
+	return app_hide_sysctl(mib, (u_int)miblen, oldp, oldlenp, newp, newlen);
+}
+
+// statfs has been hooked since round 2, but statfs64 is a symbol of its own and was left
+// open. Same shape as the *at family: filter first, otherwise re-issue the raw syscall.
+static int app_hide_statfs64(const char *path, void *buf)
+{
+	app_hide_tick();
+	if (app_hide_hidden_path(path)) { app_hide_note("statfs64", path); errno = ENOENT; return -1; }
+#ifdef SYS_statfs64
+	return (int)syscall(SYS_statfs64, path, buf);
+#else
+	errno = ENOTSUP;
+	return -1;
+#endif
+}
+
 // fork() is the classic sandbox test: on a stock device it fails for an app, on a
 // jailbroken one it succeeds. Nothing an app does legitimately needs it.
 static pid_t app_hide_fork(void)
@@ -1067,7 +1102,7 @@ static void app_hide_setup_objc(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v10"
+#define APP_HIDE_ENGINE_VERSION "v11"
 
 typedef struct {
 	const char *name;
@@ -1387,6 +1422,30 @@ void app_hide_install(void)
 				}
 				app_hide_hook(atHooks[i].name, atHooks[i].handler, NULL);
 				app_hide_note("install", atHooks[i].name);
+			}
+		}
+
+		// v11: symbols the libc wrappers and the *at family still leave open.
+		// sysctlbyname needs no original (it is reimplemented on top of sysctl), so it is
+		// always installed. statfs64 is installed only after its syscall number has been
+		// proved live here - a wrong number would make every statfs64 call in this process
+		// fail, which is worse than not hooking it at all.
+		app_hide_hook("sysctlbyname", (void *)sysctlbyname, (void *)app_hide_sysctlbyname);
+		app_hide_note("install", "sysctlbyname");
+		{
+			bool statfs64Ready = false;
+#ifdef SYS_statfs64
+			{
+				struct statfs probe = {};
+				statfs64Ready = (syscall(SYS_statfs64, "/", &probe) == 0);
+			}
+#endif
+			if (statfs64Ready) {
+				app_hide_hook("statfs64", (void *)statfs64, (void *)app_hide_statfs64);
+				app_hide_note("install", "statfs64");
+			}
+			else {
+				app_hide_note("install", "statfs64 not installed - syscall self test failed");
 			}
 		}
 	}

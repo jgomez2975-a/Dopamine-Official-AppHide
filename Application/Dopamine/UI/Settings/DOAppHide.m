@@ -198,10 +198,11 @@ static NSTimeInterval sAppHideSelfCheckAt = 0;
         // that carries the short-hook path and the xpcproxy-aware rules lookup, so a
         // clean systemhook cannot fake them.
         NSArray<NSString *> *markers = @[@"app_hide_install", @"canOpenURL",
-                                        @".DopamineAppHideRules.plist", @"engine v10",
+                                        @".DopamineAppHideRules.plist", @"engine v11",
                                         @"8 byte thunk hook",
                                         @".DopamineAppHide.spawn.log",
-                                        @"hide=%d noinject=%d"];
+                                        @"hide=%d noinject=%d",
+                                        @"sysctlbyname", @"statfs64"];
         markerTotal = markers.count;
         if (markerTotal == 0) markerTotal = 1;   // never divide by zero
 
@@ -370,6 +371,35 @@ static const NSUInteger kAppHideCrashKeep = 12;
             }
         }
     }];
+
+    // One self-contained file, so reporting back needs no screenshot and no cable.
+    // Everything the basebin side can tell the app goes in here: the installed dylib
+    // verdict, the rules file as parsed, the launch decisions launchd recorded, and the
+    // per-app logs just copied. Written even when empty - "nothing there" is a fact too.
+    {
+        NSMutableString *report = [NSMutableString new];
+        [report appendFormat:@"Dopamine AppHide report  %@\n", [NSDate date]];
+        [report appendFormat:@"app version      %@ (build %@)\n",
+            [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?",
+            [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?"];
+        [report appendFormat:@"basebin verdict  %@\n", [self appHideBasebinVerdict]];
+        [report appendFormat:@"rules state      %@\n", [self appHideDiagnostics]];
+        [report appendString:@"\n=== self check ============================================\n"];
+        [report appendString:[self appHideEnvironmentSelfCheck] ?: @"(empty)"];
+        [report appendString:@"\n\n=== collected app logs ====================================\n"];
+        NSFileManager *rfm = [NSFileManager defaultManager];
+        for (NSString *name in [[rfm contentsOfDirectoryAtPath:outDir error:nil]
+                                 sortedArrayUsingSelector:@selector(compare:)]) {
+            if (![name hasSuffix:@".log"]) continue;
+            NSString *text = [NSString stringWithContentsOfFile:
+                [outDir stringByAppendingPathComponent:name]
+                encoding:NSUTF8StringEncoding error:nil];
+            if (!text.length) continue;
+            [report appendFormat:@"\n--- %@ ---\n%@\n", name, text];
+        }
+        [report writeToFile:[documents stringByAppendingPathComponent:@"AppHideReport.txt"]
+                 atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
 
     DOAppHideTrace([NSString stringWithFormat:@"export: %lu logs, %lu crashes",
                     (unsigned long)copied, (unsigned long)crashCopied]);
