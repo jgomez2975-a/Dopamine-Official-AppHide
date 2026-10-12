@@ -109,7 +109,62 @@ static NSError *sAppHideLastError = nil;
     if (sAppHideLastError) {
         [out appendFormat:@"\nlast write failed: %@", sAppHideLastError.localizedDescription];
     }
+    [out appendFormat:@"\n%@", [self appHideCollectLogs]];
     return out;
+}
+
+// The basebin side can only write inside the container of the app it is hiding
+// (a sandboxed process may not touch /var/mobile/Library/Preferences), so
+// Dopamine does the collecting: as root and unsandboxed, copy every
+// .DopamineAppHide.log into Documents/AppHideLogs. That folder is exposed to the
+// Files app through UIFileSharingEnabled, which is how the user can see exactly
+// which paths a bank app probed - no Filza, no SSH, no cable.
+static NSString *const kAppHideLogDir  = @"AppHideLogs";
+static NSString *const kAppHideLogName = @".DopamineAppHide.log";
+static const NSUInteger kAppHideLogKeep = 40;
+
+- (NSString *)appHideCollectLogs
+{
+    __block NSUInteger copied = 0;
+    __block NSUInteger found = 0;
+
+    NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    if (!documents) return @"检测日志：拿不到 Documents 目录";
+
+    NSString *outDir = [documents stringByAppendingPathComponent:kAppHideLogDir];
+
+    [self appHideRunEscaped:^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm createDirectoryAtPath:outDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+        NSString *root = @"/var/mobile/Containers/Data/Application";
+        for (NSString *uuid in [fm contentsOfDirectoryAtPath:root error:nil]) {
+            NSString *logPath = [[root stringByAppendingPathComponent:uuid]
+                stringByAppendingPathComponent:[@"Library/Caches" stringByAppendingPathComponent:kAppHideLogName]];
+
+            NSDictionary *attrs = [fm attributesOfItemAtPath:logPath error:nil];
+            if (!attrs) continue;
+            found++;
+
+            NSDate *mtime = attrs[NSFileModificationDate] ?: [NSDate date];
+            NSString *destName = [NSString stringWithFormat:@"%@-%.0f.log", uuid, mtime.timeIntervalSince1970];
+            NSString *dest = [outDir stringByAppendingPathComponent:destName];
+            if ([fm fileExistsAtPath:dest]) continue;
+            if ([fm copyItemAtPath:logPath toPath:dest error:nil]) copied++;
+        }
+
+        NSArray<NSString *> *existing = [[fm contentsOfDirectoryAtPath:outDir error:nil]
+            sortedArrayUsingSelector:@selector(compare:)];
+        if (existing.count > kAppHideLogKeep) {
+            for (NSUInteger i = 0; i + kAppHideLogKeep < existing.count; i++) {
+                [fm removeItemAtPath:[outDir stringByAppendingPathComponent:existing[i]] error:nil];
+            }
+        }
+    }];
+
+    if (found == 0) return @"检测日志：还没有 App 探过被隐藏的路径（先跑一次目标 App）";
+    return [NSString stringWithFormat:@"检测日志：%lu 个 App 有记录，新导出 %lu 个到 文件App/我的iPhone/Dopamine/%@",
+            (unsigned long)found, (unsigned long)copied, kAppHideLogDir];
 }
 
 - (BOOL)writeAppHideRules:(NSDictionary<NSString *, NSDictionary *> *)rules error:(NSError **)error

@@ -21,5 +21,13 @@
 	</dict>
 	<key>UIViewControllerBasedStatusBarAppearance</key>
 	<true/>
+	<!-- App Hide mod: the hidden apps write what they probed into their own
+	     container (the only place their sandbox allows), and the Dopamine side
+	     copies those files into this app's Documents folder. File sharing is what
+	     makes that folder reachable from the Files app without any extra tool. -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 </dict>
 </plist>

@@ -32,6 +32,12 @@ NS_ASSUME_NONNULL_BEGIN
 // reason the last write failed (if it did).
 - (NSString *)appHideDiagnostics;
 
+// A hidden app can only write inside its own container, so the basebin side logs
+// every path it denied to <container>/Library/Caches/.DopamineAppHide.log. This
+// copies those files into Dopamine's Documents (exposed through the Files app) and
+// returns a one line summary. Runs root + unsandboxed.
+- (NSString *)appHideCollectLogs;
+
 // Serialises and installs the rules file as root + unsandboxed, then reads it back
 // and compares. Sets *error (with the real errno) when the write is denied.
 - (BOOL)writeAppHideRules:(NSDictionary<NSString *, NSDictionary *> *)rules error:(NSError **)error;
