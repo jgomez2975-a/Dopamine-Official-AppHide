@@ -670,7 +670,17 @@ static void *(*p_objc_msgSend)(void);
 
 static app_hide_imp_t gOrigAllApplications;
 static app_hide_imp_t gOrigAllInstalledApplications;
+static app_hide_imp_t gOrigCanOpenURL;
 static bool gAppListHooked = false;
+
+// URL schemes a jailbreak detector probes with -[UIApplication canOpenURL:]. This is a
+// pure method replacement (no code patching, nothing to corrupt), and here the answer
+// is simply NO - there is no legitimate reason for a hidden app to open these.
+static const char *kAppHideJBURLSchemes[] = {
+	"cydia://", "sileo://", "zebra://", "installer://", "filza://", "activator://",
+	"undecimus://", "unc0ver://", "checkra1n://", "taurine://", "odyssey://",
+	"trollstore://", "newterm://", "ssh://", "apt://", "frida://",
+};
 
 #define APP_HIDE_SEL(nameC) (p_sel_registerName(nameC))
 #define APP_HIDE_MSGSEND(type, obj, sel, ...) ((type (*)(app_hide_id, app_hide_sel_t, ...))p_objc_msgSend)(obj, sel, ##__VA_ARGS__)
@@ -740,12 +750,55 @@ static app_hide_id app_hide_all_installed_applications_hook(app_hide_id self, ap
 	return app_hide_filter_app_list(list);
 }
 
+static bool app_hide_is_jb_url(app_hide_id url)
+{
+	if (!url) return false;
+
+	app_hide_id absolute = APP_HIDE_MSGSEND(app_hide_id, url, APP_HIDE_SEL("absoluteString"));
+	if (!absolute) return false;
+
+	const char *text = APP_HIDE_MSGSEND(const char *, absolute, APP_HIDE_SEL("UTF8String"));
+	if (!text) return false;
+
+	for (size_t i = 0; i < sizeof(kAppHideJBURLSchemes) / sizeof(kAppHideJBURLSchemes[0]); i++) {
+		if (strncasecmp(text, kAppHideJBURLSchemes[i], strlen(kAppHideJBURLSchemes[i])) == 0) {
+			app_hide_note("canOpenURL", text);
+			return true;
+		}
+	}
+	return false;
+}
+
+static BOOL app_hide_can_open_url_hook(app_hide_id self, app_hide_sel_t _cmd, app_hide_id url)
+{
+	if (app_hide_is_jb_url(url)) return NO;
+	return ((BOOL (*)(app_hide_id, app_hide_sel_t, app_hide_id))gOrigCanOpenURL)(self, _cmd, url);
+}
+
 static void app_hide_install_app_list_hooks(void)
 {
 	if (gAppListHooked || !p_objc_getClass) return;
+	gAppListHooked = true;   // each hook below carries its own one-shot guard
+
+	// -[UIApplication canOpenURL:] first: UIApplication is present in every app, so
+	// this one does not depend on a framework being loaded yet. A detector asking for
+	// cydia:// / filza:// gets NO - and here that answer is a plain method replacement,
+	// nothing to corrupt.
+	app_hide_class_t appClass = p_objc_getClass("UIApplication");
+	if (appClass && !gOrigCanOpenURL) {
+		app_hide_method_t method = p_class_getInstanceMethod(appClass, APP_HIDE_SEL("canOpenURL:"));
+		if (method) {
+			app_hide_imp_t original = p_method_getImplementation(method);
+			if (original) {
+				gOrigCanOpenURL = original;
+				p_method_setImplementation(method, (app_hide_imp_t)app_hide_can_open_url_hook);
+				app_hide_note("hooked", "canOpenURL:");
+			}
+		}
+	}
 
 	app_hide_class_t workspaceClass = p_objc_getClass("LSApplicationWorkspace");
-	if (!workspaceClass) return;
+	if (!workspaceClass) return;   // not loaded yet: gAppListRetry will bring us back
 
 	struct { const char *name; app_hide_imp_t *original; app_hide_imp_t hook; } hooks[] = {
 		{ "allApplications",          &gOrigAllApplications,          (app_hide_imp_t)app_hide_all_applications_hook },
@@ -753,14 +806,17 @@ static void app_hide_install_app_list_hooks(void)
 	};
 
 	for (size_t i = 0; i < sizeof(hooks) / sizeof(hooks[0]); i++) {
+		// One-shot per method: without this, a second pass would capture our own hook
+		// as the "original" and recurse into itself on the first call.
+		if (*hooks[i].original) continue;
 		app_hide_method_t method = p_class_getInstanceMethod(workspaceClass, APP_HIDE_SEL(hooks[i].name));
 		if (!method) continue;
-		*hooks[i].original = p_method_getImplementation(method);
-		if (!*hooks[i].original) continue;
+		app_hide_imp_t original = p_method_getImplementation(method);
+		if (!original) continue;
+		*hooks[i].original = original;
 		p_method_setImplementation(method, hooks[i].hook);
 		app_hide_note("hooked", hooks[i].name);
 	}
-	gAppListHooked = true;
 }
 
 // LSApplicationWorkspace lives in a framework the app loads on demand. The hook is
@@ -938,6 +994,12 @@ void app_hide_install(void)
 	if (!marker) marker = getenv("DOPAMINE_APP_HIDE");   // older basebin
 	if (!marker || strcmp(marker, "1") != 0) return;
 
+	// v7: round 2 is ON by default - it is the part that actually answers a banking
+	// SDK (fork / sysctl / statfs / getattrlist / the LaunchServices app list), and the
+	// device report is that v4 hid nothing without it. _JBEnvMode=0 still turns it off,
+	// so the aggressive half can be bisected without a rebuild.
+	bool aggressive = !(marker && strcmp(marker, "0") == 0);
+
 	if (JB_RootPath && JB_RootPath[0] == '/') {
 		size_t len = strlen(JB_RootPath);
 		if (len >= sizeof(gAppHideJBRoot)) len = sizeof(gAppHideJBRoot) - 1;
@@ -970,19 +1032,25 @@ void app_hide_install(void)
 	app_hide_hook("readlink", (void *)readlink, (void *)app_hide_readlink);
 
 	// Round 2: the checks a banking app's hardening SDK reaches for after the
-	// plain file probes came back clean. These are the ones most likely to be
-	// unreachable syscall thunks, in which case they are skipped instead of
-	// corrupting the shared cache.
-	app_hide_hook("fork",        (void *)fork,        (void *)app_hide_fork);
-	app_hide_hook("sysctl",      (void *)sysctl,      (void *)app_hide_sysctl);
-	app_hide_hook("statfs",      (void *)statfs,      (void *)app_hide_statfs);
-	app_hide_hook("getattrlist", (void *)getattrlist, (void *)app_hide_getattrlist);
+	// plain file probes came back clean. OFF unless _JBEnvMode=2 - see the note at
+	// the top of this function. When it is on, these are also the ones most likely to
+	// be bare syscall thunks, in which case the guard skips them instead of
+	// corrupting the shared cache next door.
+	if (aggressive) {
+		app_hide_hook("fork",        (void *)fork,        (void *)app_hide_fork);
+		app_hide_hook("sysctl",      (void *)sysctl,      (void *)app_hide_sysctl);
+		app_hide_hook("statfs",      (void *)statfs,      (void *)app_hide_statfs);
+		app_hide_hook("getattrlist", (void *)getattrlist, (void *)app_hide_getattrlist);
 
-	// Installed-application list (LaunchServices): resolved through dlsym and
-	// installed later, from app_hide_tick() - never from here, because this runs
-	// inside a dyld constructor and swizzling a class while images are still being
-	// loaded is not safe. A process without the ObjC runtime skips it entirely.
-	app_hide_setup_objc();
+		// Installed-application list (LaunchServices): resolved through dlsym and
+		// installed later, from app_hide_tick() - never from here, because this runs
+		// inside a dyld constructor and swizzling a class while images are still
+		// being loaded is not safe. A process without the ObjC runtime skips it.
+		app_hide_setup_objc();
+	}
+	else {
+		app_hide_note("install", "round 2 (fork/sysctl/statfs/getattrlist/LS list) OFF - set _JBEnvMode=2 to enable");
+	}
 
 	app_hide_report_hooks();
 

@@ -18,7 +18,49 @@
 #define APP_HIDE_RULES_GROUP 501
 #define APP_HIDE_RULES_MODE 0644
 
+// Breadcrumbs land in the app's own Documents folder - the one place the Files app
+// can read with no tooling - so a launch or a panel load that dies still leaves
+// evidence of how far it got. Deliberately tiny and exception proof: a breadcrumb
+// must never be the reason something fails.
+void DOAppHideTrace(NSString *message)
+{
+    @try {
+        NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+        if (documents.length == 0) return;
+
+        NSString *dir = [documents stringByAppendingPathComponent:@"AppHideLogs"];
+        NSString *path = [dir stringByAppendingPathComponent:@"boot.log"];
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        NSDictionary *attrs = [fm attributesOfItemAtPath:path error:nil];
+        if ([attrs[NSFileSize] unsignedLongValue] > 64 * 1024) {
+            [fm removeItemAtPath:path error:nil];
+        }
+        else if (!attrs) {
+            [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        }
+
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], message ?: @"?"];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [line writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            return;
+        }
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } @catch (NSException *e) {
+    }
+}
+
 @implementation DOEnvironmentManager (AppHide)
+
+// Written before anything else can fail, so the file exists even if the app dies
+// later in this category's +load.
++ (void)load
+{
+    DOAppHideTrace(@"DOAppHide category +load");
+}
 
 - (NSString *)appHideRulesPath
 {
@@ -101,6 +143,8 @@ static NSError *sAppHideLastError = nil;
 
 // Shown in the panel footer: what is really on disk right now, plus the reason
 // the last write failed (errno text included) so a failure is never silent.
+// Panel-open path only: the log/crash copy walks every app container as root, so it
+// lives behind the export row instead of running on every screen load.
 - (NSString *)appHideDiagnostics
 {
     NSDictionary *onDisk = [self appHideRulesFromDisk];
@@ -109,7 +153,8 @@ static NSError *sAppHideLastError = nil;
     if (sAppHideLastError) {
         [out appendFormat:@"\nlast write failed: %@", sAppHideLastError.localizedDescription];
     }
-    [out appendFormat:@"\n%@", [self appHideCollectLogs]];
+    [out appendString:@"\n日志 / 崩溃报告：点下面那一行导出到 Documents/AppHideLogs"];
+    [out appendFormat:@"\n%@", [self appHideEnvironmentSelfCheck]];
     return out;
 }
 
@@ -117,6 +162,58 @@ static NSError *sAppHideLastError = nil;
 // (a sandboxed process may not touch /var/mobile/Library/Preferences), so
 // Dopamine does the collecting: as root and unsandboxed, copy every
 // .DopamineAppHide.log into Documents/AppHideLogs. That folder is exposed to the
+
+// "Hide Jailbreak Environment" can only work if the basebin that is actually installed
+// is this mod's basebin: the switch writes a rules file, and it is launchdhook that
+// consults it at spawn time and systemhook that hides the paths. An un-updated
+// environment (app updated, "Update Environment" never run) leaves a stock basebin in
+// place, and then every switch looks correct and changes nothing - which is exactly the
+// failure being chased. So look for the mod's own strings inside the installed dylibs.
+- (NSString *)appHideEnvironmentSelfCheck
+{
+    __block NSString *result = nil;
+
+    [self appHideRunEscaped:^{
+        NSString *root = @"/var/jb";
+        if (![[NSFileManager defaultManager] fileExistsAtPath:root]) root = @"/";
+
+        NSArray<NSString *> *targets = @[
+            [root stringByAppendingPathComponent:@"basebin/systemhook.dylib"],
+            [root stringByAppendingPathComponent:@"basebin/launchdhook.dylib"],
+        ];
+        NSArray<NSString *> *markers = @[@"app_hide_install", @"canOpenURL", @".DopamineAppHideRules.plist"];
+
+        NSMutableArray<NSString *> *lines = [NSMutableArray new];
+        for (NSString *path in targets) {
+            NSData *data = [NSData dataWithContentsOfFile:path options:0 error:nil];
+            NSString *name = path.lastPathComponent;
+            if (!data.length) {
+                [lines addObject:[NSString stringWithFormat:@"%@：读不到", name]];
+                continue;
+            }
+
+            NSUInteger hits = 0;
+            for (NSString *marker in markers) {
+                if ([data rangeOfData:[marker dataUsingEncoding:NSUTF8StringEncoding]
+                              options:0
+                                range:NSMakeRange(0, data.length)].location != NSNotFound) {
+                    hits++;
+                }
+            }
+            [lines addObject:[NSString stringWithFormat:@"%@：%@（%lu/%lu 标记，%.1f MB）",
+                              name, hits == markers.count ? @"魔改版 ✅" : (hits ? @"部分匹配 ⚠️" : @"原版 ❌"),
+                              (unsigned long)hits, (unsigned long)markers.count,
+                              data.length / 1024.0 / 1024.0]];
+        }
+        result = [lines componentsJoinedByString:@"\n"];
+    }];
+
+    if (!result.length) {
+        return @"环境自检：无法提权读取 /var/jb/basebin（先越狱并在 Dopamine 里点 Update Environment）";
+    }
+    return [NSString stringWithFormat:@"环境自检：\n%@", result];
+}
+
 // Files app through UIFileSharingEnabled, which is how the user can see exactly
 // which paths a bank app probed - no Filza, no SSH, no cable.
 static NSString *const kAppHideLogDir  = @"AppHideLogs";
@@ -127,6 +224,9 @@ static const NSUInteger kAppHideCrashKeep = 12;
 
 - (NSString *)appHideCollectLogs
 {
+    DOAppHideTrace(@"export: start");
+
+    @try {
     __block NSUInteger copied = 0;
     __block NSUInteger found = 0;
     __block NSUInteger crashCopied = 0;
@@ -194,10 +294,18 @@ static const NSUInteger kAppHideCrashKeep = 12;
         }
     }];
 
+    DOAppHideTrace([NSString stringWithFormat:@"export: %lu logs, %lu crashes",
+                    (unsigned long)copied, (unsigned long)crashCopied]);
+
     if (found == 0 && crashCopied == 0) return @"检测日志：还没有 App 探过被隐藏的路径（先跑一次目标 App）";
     return [NSString stringWithFormat:
             @"检测日志：%lu 个 App 有记录，新导出 %lu 个日志、%lu 个崩溃报告到 文件App/我的iPhone/Dopamine/%@",
             (unsigned long)found, (unsigned long)copied, (unsigned long)crashCopied, kAppHideLogDir];
+    }
+    @catch (NSException *e) {
+        DOAppHideTrace([@"export: NSException " stringByAppendingString:e.reason ?: @"?"]);
+        return [NSString stringWithFormat:@"导出失败：%@", e.reason ?: @"未知异常"];
+    }
 }
 
 - (BOOL)writeAppHideRules:(NSDictionary<NSString *, NSDictionary *> *)rules error:(NSError **)error

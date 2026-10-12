@@ -49,13 +49,18 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 - (void)viewDidLoad
 {
     [super viewDidLoad];
-    // In case the OS asks for specifiers before the view appears.
-    [self appHideBuildAllSpecifiers];
+    // v7: nothing but the breadcrumb here. v5 built the whole app list in viewDidLoad,
+    // which meant the first root escalation (jbclient runAsRoot + the sandbox label
+    // drop) happened while the view hierarchy was still loading - and that build is the
+    // one that started crashing the moment the panel was opened. The list is built
+    // lazily from -specifiers instead, exactly like v4 did.
+    DOAppHideTrace(@"panel viewDidLoad");
 }
 
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
+    DOAppHideTrace(@"panel viewWillAppear");
     // Re-read the rules file every time the panel is entered: the file is the
     // single source of truth, and it lives outside the container.
     [[DOEnvironmentManager sharedManager] appHideInvalidateRulesCache];
@@ -68,22 +73,27 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 
 - (void)appHideInstallSearchBar
 {
-    // PSListController declares `table` as id, so the cast is required to reach the
-    // UITableView properties.
-    UITableView *table = (UITableView *)self.table;
+    // A search bar must never be able to take the panel down, and the table really can
+    // be nil this early in the lifecycle.
+    @try {
+        UITableView *table = (UITableView *)self.table;   // PSListController declares `table` as id
+        if (!table) return;
 
-    if (!self.appHideSearchBar) {
-        UISearchBar *bar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, table.bounds.size.width, 44)];
-        bar.delegate = self;
-        bar.placeholder = @"搜索 App 名称或 Bundle ID（如 农行 / abchina）";
-        bar.autocapitalizationType = UITextAutocapitalizationTypeNone;
-        bar.autocorrectionType = UITextAutocorrectionTypeNo;
-        bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-        bar.searchBarStyle = UISearchBarStyleMinimal;
-        self.appHideSearchBar = bar;
-    }
-    if (table.tableHeaderView != self.appHideSearchBar) {
-        table.tableHeaderView = self.appHideSearchBar;
+        if (!self.appHideSearchBar) {
+            UISearchBar *bar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, table.bounds.size.width, 44)];
+            bar.delegate = self;
+            bar.placeholder = @"搜索 App 名称或 Bundle ID（如 农行 / abchina）";
+            bar.autocapitalizationType = UITextAutocapitalizationTypeNone;
+            bar.autocorrectionType = UITextAutocorrectionTypeNo;
+            bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+            bar.searchBarStyle = UISearchBarStyleMinimal;
+            self.appHideSearchBar = bar;
+        }
+        if (table.tableHeaderView != self.appHideSearchBar) {
+            table.tableHeaderView = self.appHideSearchBar;
+        }
+    } @catch (NSException *e) {
+        DOAppHideTrace([@"search bar failed: " stringByAppendingString:e.reason ?: @"?"]);
     }
 }
 
@@ -108,7 +118,19 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 - (NSArray *)specifiers
 {
     if (!_specifiers) {
-        _specifiers = [self appHideFilteredSpecifiers];
+        // Last line of defence: building the list talks to jbclient and walks every
+        // installed bundle, and a failure in there must degrade to a readable row
+        // rather than take the app down.
+        @try {
+            _specifiers = [self appHideFilteredSpecifiers];
+        } @catch (NSException *e) {
+            DOAppHideTrace([@"specifiers failed: " stringByAppendingString:e.reason ?: @"?"]);
+            PSSpecifier *group = [PSSpecifier emptyGroupSpecifier];
+            group.name = @"App Hiding";
+            [group setProperty:[NSString stringWithFormat:@"面板加载失败：%@", e.reason ?: @"未知异常"]
+                        forKey:@"footerText"];
+            _specifiers = @[group];
+        }
     }
     return _specifiers;
 }
@@ -117,10 +139,14 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 {
     if (self.appHideAllSpecifiers) return self.appHideAllSpecifiers;
 
+    DOAppHideTrace(@"specifiers: build start");
+
     NSMutableArray<PSSpecifier *> *specifiers = [NSMutableArray new];
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
 
     NSArray<NSDictionary *> *apps = [envManager appHideInstalledApps];
+    DOAppHideTrace([NSString stringWithFormat:@"specifiers: %lu installed apps", (unsigned long)apps.count]);
+
     NSUInteger hiddenCount = 0;
     for (NSDictionary *app in apps) {
         if ([envManager isEnvironmentHiddenForBundleID:app[@"bundleID"]]) hiddenCount++;
@@ -135,12 +161,30 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
                      forKey:@"footerText"];
     [specifiers addObject:headerGroup];
 
+    // Log / crash-report export on demand. The copy walks every app container as root
+    // and is the slowest thing in this screen, so it is a row the user taps instead of
+    // work done on every panel open.
+    PSSpecifier *exportSpecifier = [PSSpecifier preferenceSpecifierNamed:@"导出检测日志 / 崩溃报告"
+                                                                  target:self
+                                                                     set:nil
+                                                                     get:nil
+                                                                  detail:nil
+                                                                    cell:PSButtonCell
+                                                                    edit:nil];
+    [exportSpecifier setProperty:@YES forKey:@"enabled"];
+    [exportSpecifier setProperty:NSStringFromSelector(@selector(appHideExportLogs)) forKey:@"action"];
+    [specifiers addObject:exportSpecifier];
+
     for (NSDictionary *app in apps) {
         NSString *bundleID = app[@"bundleID"];
 
         PSSpecifier *appGroup = [PSSpecifier emptyGroupSpecifier];
         appGroup.name = app[@"name"];
         [appGroup setProperty:bundleID forKey:@"footerText"];
+        // Tag every row of an app block with its bundle id: the search filter groups
+        // rows by this instead of by position, so extra rows (the export button above)
+        // cannot shift the blocks apart.
+        [appGroup setProperty:bundleID forKey:@"appHideBundleID"];
         [specifiers addObject:appGroup];
 
         PSSpecifier *hideSpecifier = [PSSpecifier preferenceSpecifierNamed:@"Hide Jailbreak Environment"
@@ -152,6 +196,7 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
                                                                      edit:nil];
         [hideSpecifier setProperty:@YES forKey:@"enabled"];
         [hideSpecifier setProperty:bundleID forKey:@"bundleID"];
+        [hideSpecifier setProperty:bundleID forKey:@"appHideBundleID"];
         [hideSpecifier setProperty:@NO forKey:@"default"];
         [specifiers addObject:hideSpecifier];
 
@@ -164,6 +209,7 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
                                                                          edit:nil];
         [noInjectSpecifier setProperty:@YES forKey:@"enabled"];
         [noInjectSpecifier setProperty:bundleID forKey:@"bundleID"];
+        [noInjectSpecifier setProperty:bundleID forKey:@"appHideBundleID"];
         [noInjectSpecifier setProperty:@NO forKey:@"default"];
         [specifiers addObject:noInjectSpecifier];
     }
@@ -178,29 +224,33 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     NSString *query = self.appHideQuery;
     if (query.length == 0) return all;
 
-    // Layout is exactly [header, (group, hide, noInject) * N]; anything else means
-    // this code and the builder drifted apart, in which case showing everything is
-    // the only safe answer.
-    if (all.count < 4 || (all.count - 1) % 3 != 0) return all;
-
     DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
     NSMutableArray<PSSpecifier *> *filtered = [NSMutableArray new];
-    [filtered addObject:all[0]];
 
-    for (NSUInteger i = 1; i + 2 < all.count; i += 3) {
-        PSSpecifier *group = all[i];
-        NSString *bundleID = [group propertyForKey:@"footerText"] ?: @"";
+    // Rows are grouped by the bundle id they carry, not by their position: the header
+    // and the export row are added without one, so no extra row can shift the blocks.
+    NSUInteger i = 0;
+    while (i < all.count) {
+        PSSpecifier *specifier = all[i];
+        NSString *bundleID = [specifier propertyForKey:@"appHideBundleID"];
+        if (![bundleID isKindOfClass:[NSString class]] || bundleID.length == 0) {
+            [filtered addObject:specifier];
+            i++;
+            continue;
+        }
 
-        BOOL matches = DOAppHideFuzzyMatch(group.name, query) || DOAppHideFuzzyMatch(bundleID, query);
+        NSUInteger start = i;
+        while (i < all.count && [[all[i] propertyForKey:@"appHideBundleID"] isEqual:bundleID]) i++;
+        NSUInteger end = i;
+
+        BOOL matches = DOAppHideFuzzyMatch(specifier.name, query) || DOAppHideFuzzyMatch(bundleID, query);
         // Already enabled apps stay visible whatever the query is: hiding one must
         // never make it impossible to unhide it again.
         BOOL enabled = [envManager isEnvironmentHiddenForBundleID:bundleID] ||
                        [envManager isEnvironmentNoInjectForBundleID:bundleID];
         if (!matches && !enabled) continue;
 
-        [filtered addObject:group];
-        [filtered addObject:all[i + 1]];
-        [filtered addObject:all[i + 2]];
+        for (NSUInteger j = start; j < end; j++) [filtered addObject:all[j]];
     }
 
     if (filtered.count == 1) {
@@ -211,6 +261,20 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
         [filtered addObject:emptyGroup];
     }
     return filtered;
+}
+
+#pragma mark - log export
+
+- (void)appHideExportLogs
+{
+    DOAppHideTrace(@"export row tapped");
+    NSString *summary = [[DOEnvironmentManager sharedManager] appHideCollectLogs];
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"导出结果"
+                                                                   message:summary
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 #pragma mark - switch handlers
@@ -224,12 +288,14 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 - (void)setHidden:(NSNumber *)value specifier:(PSSpecifier *)specifier
 {
     NSString *bundleID = [specifier propertyForKey:@"bundleID"];
+    DOAppHideTrace([NSString stringWithFormat:@"toggle HideEnv %@ -> %@", bundleID, value]);
 
     NSError *error = nil;
     if (![[DOEnvironmentManager sharedManager] setEnvironmentHidden:value.boolValue
                                                        forBundleID:bundleID
                                                              error:&error]) {
         // Never fail silently: the switch would just snap back with no reason.
+        DOAppHideTrace([NSString stringWithFormat:@"toggle HideEnv FAILED: %@", error.localizedDescription]);
         [self presentAppHideError:error];
     }
     // Re-read from disk so the switch shows what actually landed (NoInject also
@@ -246,11 +312,13 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 - (void)setNoInject:(NSNumber *)value specifier:(PSSpecifier *)specifier
 {
     NSString *bundleID = [specifier propertyForKey:@"bundleID"];
+    DOAppHideTrace([NSString stringWithFormat:@"toggle NoInject %@ -> %@", bundleID, value]);
 
     NSError *error = nil;
     if (![[DOEnvironmentManager sharedManager] setEnvironmentNoInject:value.boolValue
                                                          forBundleID:bundleID
                                                                error:&error]) {
+        DOAppHideTrace([NSString stringWithFormat:@"toggle NoInject FAILED: %@", error.localizedDescription]);
         [self presentAppHideError:error];
     }
     [self reloadSpecifiers];

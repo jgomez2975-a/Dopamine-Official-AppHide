@@ -15,6 +15,12 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// Breadcrumb written into Documents/AppHideLogs/boot.log, which the Files app can
+// read even when the app dies before the UI appears. No root and no escalation: it
+// only ever touches the app's own container. Used to find where a launch or a panel
+// load stops.
+FOUNDATION_EXPORT void DOAppHideTrace(NSString *message);
+
 @interface DOEnvironmentManager (AppHide)
 
 // Absolute path of the rules file (same path the basebin side reads).
@@ -31,6 +37,11 @@ NS_ASSUME_NONNULL_BEGIN
 // Human readable state for the panel footer: path, entry count on disk and the
 // reason the last write failed (if it did).
 - (NSString *)appHideDiagnostics;
+
+// Panel footer diagnostic: reads the installed /var/jb/basebin dylibs and reports
+// whether they are this mod's build. Without that basebin the switches write a rules
+// file that nothing ever consults.
+- (NSString *)appHideEnvironmentSelfCheck;
 
 // A hidden app can only write inside its own container, so the basebin side logs
 // every path it denied to <container>/Library/Caches/.DopamineAppHide.log. This
