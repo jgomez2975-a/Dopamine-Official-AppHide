@@ -891,11 +891,12 @@ static void app_hide_setup_objc(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v7"
+#define APP_HIDE_ENGINE_VERSION "v8"
 
 typedef struct {
 	const char *name;
 	bool installed;
+	bool shortHook;
 	const char *skipReason;
 } app_hide_hook_result;
 
@@ -937,6 +938,123 @@ static bool app_hide_function_is_patchable(const void *function)
 }
 #endif
 
+#ifdef __arm64__
+// litehook's function hook writes a FIXED 20 bytes: movz + 3x movk + br, which is why the
+// guard above refuses Darwin's syscall thunks - they are three instructions wide
+// (mov x16,#n / svc #0x80 / ret, 12 bytes) and live back to back in the shared cache, so a
+// 20 byte write would take the next exported symbol with it.
+//
+// litehook_hook_memory() however takes an arbitrary byte count, so a thunk can still be
+// detoured with two instructions: adrp x16, <page> / br x16 (8 bytes, ending exactly on the
+// svc). The real jump - litehook's own movz/movk/br sequence, byte for byte - is placed at
+// the start of a page allocated for it, which adrp reaches anywhere inside +/-4GB.
+//
+// Everything here is gated on the target actually being a syscall thunk measured at
+// runtime: if the shape does not match, the hook is skipped exactly as before. Nothing about
+// this path is speculative on a target that does not have that shape.
+
+#define APP_HIDE_ADRP_REACH (1LL << 31)
+
+static uint32_t app_hide_gen_movk(uint8_t reg, uint16_t value, uint16_t lsl)
+{
+	uint32_t base = 0b11110010100000000000000000000000;   // movk Xd, #imm16, LSL #hw
+	uint32_t hw = 0;
+	if (lsl == 16) hw = 0b01 << 21;
+	else if (lsl == 32) hw = 0b10 << 21;
+	else if (lsl == 48) hw = 0b11 << 21;
+	return base | hw | ((uint32_t)value << 5) | (reg & 0x1F);
+}
+
+static uint32_t app_hide_gen_br(uint8_t reg)
+{
+	return 0b11010110000111110000000000000000 | (((uint32_t)reg & 0x1F) << 5);
+}
+
+static uint32_t app_hide_gen_adrp(uint8_t reg, int64_t pageDelta)
+{
+	int64_t imm21 = pageDelta >> 12;
+	uint32_t immlo = (uint32_t)(imm21 & 0x3);
+	uint32_t immhi = (uint32_t)((imm21 >> 2) & 0x7FFFF);
+	return 0x90000000u | (immlo << 29) | (immhi << 5) | (reg & 0x1F);
+}
+
+// mov x16,#n / svc #0x80 / ret, with the x16/x17 setup in the first slot.
+static bool app_hide_is_syscall_thunk(const void *function)
+{
+	const uint32_t *insn = (const uint32_t *)function;
+	if ((insn[0] & 0xFF800000) != 0xD2800000 &&      // movz Xd
+	    (insn[0] & 0xFF800000) != 0xF2800000) {      // movk Xd
+		return false;
+	}
+	if ((insn[0] & 0x1F) != 16 && (insn[0] & 0x1F) != 17) return false;
+	if (insn[1] != 0xD4001001) return false;         // svc #0x80
+	if ((insn[2] & 0xFFFFFC1F) != 0xD65F0000) return false;   // ret
+	return true;
+}
+
+static void *app_hide_alloc_exec_page_near(void *near)
+{
+	const vm_size_t pageSize = 0x4000;
+
+	// Mach honours a free hint, so aim at the page the thunk lives in first and then at
+	// a few offsets inside the same 4GB window.
+	for (int attempt = 0; attempt < 6; attempt++) {
+		vm_address_t hint = (vm_address_t)((uintptr_t)near & ~(uintptr_t)(pageSize - 1));
+		if (attempt > 0) hint += (vm_address_t)attempt * 0x20000000ULL;
+
+		vm_address_t addr = hint;
+		if (vm_allocate(mach_task_self(), &addr, pageSize, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+			continue;
+		}
+		int64_t distance = (int64_t)addr - (int64_t)(uintptr_t)near;
+		if (distance > -APP_HIDE_ADRP_REACH && distance < APP_HIDE_ADRP_REACH) {
+			return (void *)addr;
+		}
+		vm_deallocate(mach_task_self(), addr, pageSize);
+	}
+	return NULL;
+}
+
+static bool app_hide_short_hook(void *target, void *replacement)
+{
+	if (!app_hide_is_syscall_thunk(target)) return false;
+
+	void *page = app_hide_alloc_exec_page_near(target);
+	if (!page) return false;
+
+	uint32_t *trampoline = (uint32_t *)page;
+	uint64_t destination = (uint64_t)(uintptr_t)replacement;
+	trampoline[0] = app_hide_gen_movk(16, (uint16_t)(destination >>  0),  0);
+	trampoline[1] = app_hide_gen_movk(16, (uint16_t)(destination >> 16), 16);
+	trampoline[2] = app_hide_gen_movk(16, (uint16_t)(destination >> 32), 32);
+	trampoline[3] = app_hide_gen_movk(16, (uint16_t)(destination >> 48), 48);
+	trampoline[4] = app_hide_gen_br(16);
+
+	__builtin___clear_cache((char *)page, (char *)page + 20);
+
+	if (vm_protect(mach_task_self(), (vm_address_t)page, 0x4000, false,
+	               VM_PROT_READ | VM_PROT_EXECUTE) != KERN_SUCCESS) {
+		vm_deallocate(mach_task_self(), (vm_address_t)page, 0x4000);
+		return false;
+	}
+
+	uint32_t patch[2] = {
+		app_hide_gen_adrp(16, (int64_t)(uintptr_t)page - (int64_t)(uintptr_t)target),
+		app_hide_gen_br(16),
+	};
+	if (litehook_hook_memory(target, patch, sizeof(patch)) != KERN_SUCCESS) return false;
+
+	// Read back: a patch that did not land must not be reported as installed.
+	return ((const uint32_t *)target)[0] == patch[0] && ((const uint32_t *)target)[1] == patch[1];
+}
+#else
+static bool app_hide_short_hook(void *target, void *replacement)
+{
+	(void)target; (void)replacement;
+	return false;
+}
+#endif
+
 static void app_hide_hook(const char *name, void *target, void *replacement)
 {
 	const char *skipReason = NULL;
@@ -944,19 +1062,28 @@ static void app_hide_hook(const char *name, void *target, void *replacement)
 	if (!target) {
 		skipReason = "symbol not found";
 	}
-	else if (!app_hide_function_is_patchable(target)) {
-		skipReason = "short stub - a 20 byte patch would clobber the next symbol";
-	}
 
 	bool installed = false;
+	bool shortHook = false;
 	if (!skipReason) {
-		installed = litehook_hook_function(target, replacement) == KERN_SUCCESS;
-		if (!installed) skipReason = "litehook rejected the address";
+		if (app_hide_function_is_patchable(target)) {
+			installed = litehook_hook_function(target, replacement) == KERN_SUCCESS;
+			if (!installed) skipReason = "litehook rejected the address";
+		}
+		else if (app_hide_short_hook(target, replacement)) {
+			// A three instruction syscall thunk: 20 bytes were impossible, two are enough.
+			installed = true;
+			shortHook = true;
+		}
+		else {
+			skipReason = "short stub - neither the 20 byte patch nor the 8 byte thunk patch fit";
+		}
 	}
 
 	if (gAppHideHookCount < APP_HIDE_HOOK_MAX) {
 		gAppHideHooks[gAppHideHookCount].name = name;
 		gAppHideHooks[gAppHideHookCount].installed = installed;
+		gAppHideHooks[gAppHideHookCount].shortHook = shortHook;
 		gAppHideHooks[gAppHideHookCount].skipReason = skipReason;
 		gAppHideHookCount++;
 	}
@@ -976,7 +1103,8 @@ static void app_hide_report_hooks(void)
 
 	for (size_t i = 0; i < gAppHideHookCount; i++) {
 		if (gAppHideHooks[i].installed) {
-			snprintf(line, sizeof(line), "%s installed", gAppHideHooks[i].name);
+			snprintf(line, sizeof(line), "%s installed%s", gAppHideHooks[i].name,
+			         gAppHideHooks[i].shortHook ? " (8 byte thunk hook)" : "");
 		}
 		else {
 			snprintf(line, sizeof(line), "%s SKIPPED (%s)", gAppHideHooks[i].name,
