@@ -68,8 +68,12 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 
 - (void)appHideInstallSearchBar
 {
+    // PSListController declares `table` as id, so the cast is required to reach the
+    // UITableView properties.
+    UITableView *table = (UITableView *)self.table;
+
     if (!self.appHideSearchBar) {
-        UISearchBar *bar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, self.table.bounds.size.width, 44)];
+        UISearchBar *bar = [[UISearchBar alloc] initWithFrame:CGRectMake(0, 0, table.bounds.size.width, 44)];
         bar.delegate = self;
         bar.placeholder = @"搜索 App 名称或 Bundle ID（如 农行 / abchina）";
         bar.autocapitalizationType = UITextAutocapitalizationTypeNone;
@@ -78,8 +82,8 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
         bar.searchBarStyle = UISearchBarStyleMinimal;
         self.appHideSearchBar = bar;
     }
-    if (self.table.tableHeaderView != self.appHideSearchBar) {
-        self.table.tableHeaderView = self.appHideSearchBar;
+    if (table.tableHeaderView != self.appHideSearchBar) {
+        table.tableHeaderView = self.appHideSearchBar;
     }
 }
 
