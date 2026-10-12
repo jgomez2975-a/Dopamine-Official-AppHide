@@ -14,7 +14,7 @@
 // Version of the panel code itself, shown in the first row. The engine inside the
 // basebin has its own version (it logs "engine vN"), and keeping them visible together
 // is how "the app updated but the basebin did not" stops being invisible.
-#define APP_HIDE_PANEL_VERSION @"v22"
+#define APP_HIDE_PANEL_VERSION @"v23"
 
 // Name matching for the search field. Substring first, then subsequence, so the
 // short forms people actually type still find the app: "农行" -> 中国农业银行

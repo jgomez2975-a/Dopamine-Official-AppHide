@@ -22,6 +22,7 @@
 
 #include <dirent.h>
 #include <dlfcn.h>
+#include <dispatch/dispatch.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -539,6 +540,74 @@ static DIR *app_hide_opendir(const char *path)
 	if (!dir) close(fd);
 	return dir;
 }
+
+#pragma mark - dyld interposition (v17)
+
+// The device log answered the "hiding does not hide anything" question with facts:
+//
+//     hook stat SKIPPED (short stub - neither the 20 byte patch nor the 8 byte thunk patch fit)
+//     hook lstat SKIPPED ... hook access SKIPPED ... hook opendir SKIPPED ... hook readlink SKIPPED
+//     install engine: 2 hooks active, 5 skipped
+//
+// Those five are 12-16 byte trampolines in the dyld shared cache. litehook overwrites a fixed 20
+// bytes and the thunk path needs 8; neither fits without spilling into the neighbouring export,
+// so app_hide_function_is_patchable() refuses them - correct, but the consequence had never been
+// read back: inside a "hidden" app only open and fopen were ever filtered, and one stat("/var/jb")
+// walked straight through to a banking SDK.
+//
+// Interposing does not patch code at all. dyld reads this section at load time and rebinds the
+// symbol for the images loaded after us - for a dylib injected by the merged dyld at launch,
+// that is the whole app. It is the mechanism Darwin provides for exactly this case, and it costs
+// no code bytes in the shared cache.
+//
+// The handlers are unchanged and already safe for it: every pass-through above goes to the *at()
+// sibling (fstatat / faccessat / openat / readlinkat), never to the interposed name, so an
+// interposed call cannot re-enter itself. A process that is not being hidden has
+// app_hide_hidden_path() return false, so its only cost is one predicate per call.
+#define APP_HIDE_INTERPOSE(replacement, replacee)                                  \
+	__attribute__((used)) static struct {                                          \
+		const void *replacement;                                                   \
+		const void *replacee;                                                      \
+	} _app_hide_interpose_##replacee                                               \
+		__attribute__((section("__DATA,__interpose"))) = {                         \
+			(const void *)(unsigned long)&replacement,                             \
+			(const void *)(unsigned long)&replacee,                                \
+		}
+
+// The five the patch guard refuses, plus the rest of the path-taking face of the engine so that
+// the plain filesystem view is complete even with the advanced hook set switched off.
+//
+// Only handlers that (a) pass through with a raw syscall or an *at() sibling and (b) gate on
+// app_hide_hidden_path() before deviating are listed here. fork/ptrace/sysctl/getfsstat are
+// deliberately absent: they deviate unconditionally (fork always returns EPERM), which is correct
+// when the engine is installed only inside a hidden process and wrong the moment the hook is
+// global - interposing those would break fork and process listing for every process on the
+// device. They stay in the advanced set, installed per app.
+APP_HIDE_INTERPOSE(app_hide_stat,      stat);
+APP_HIDE_INTERPOSE(app_hide_lstat,     lstat);
+APP_HIDE_INTERPOSE(app_hide_access,    access);
+APP_HIDE_INTERPOSE(app_hide_readlink,  readlink);
+APP_HIDE_INTERPOSE(app_hide_opendir,   opendir);
+APP_HIDE_INTERPOSE(app_hide_open,      open);
+APP_HIDE_INTERPOSE(app_hide_fopen,     fopen);
+// The *at() family: several SDKs call fstatat/openat directly and never touch the wrappers above,
+// so leaving these out would leave the same hole one level down. Guarded exactly like the
+// definitions, so a toolchain without the syscall number cannot produce a dangling reference.
+#ifdef SYS_fstatat
+APP_HIDE_INTERPOSE(app_hide_fstatat,   fstatat);
+#endif
+#ifdef SYS_faccessat
+APP_HIDE_INTERPOSE(app_hide_faccessat, faccessat);
+#endif
+#ifdef SYS_openat
+APP_HIDE_INTERPOSE(app_hide_openat,    openat);
+#endif
+#ifdef SYS_readlinkat
+APP_HIDE_INTERPOSE(app_hide_readlinkat, readlinkat);
+#endif
+// Filesystem and attribute queries the path hooks above cannot cover.
+APP_HIDE_INTERPOSE(app_hide_statfs,    statfs);
+APP_HIDE_INTERPOSE(app_hide_getattrlist, getattrlist);
 
 #pragma mark - hooks without a usable sibling (raw syscall passthrough)
 
@@ -1097,6 +1166,40 @@ static void app_hide_setup_objc(void)
 	// report demanded.
 }
 
+static void app_hide_deferred_dyld_body(void)
+{
+	app_hide_hide_image_paths();
+	app_hide_register_image_callback();
+	app_hide_note("install", "dyld image work ran in the deferred thread");
+}
+
+// dispatch_async_f, not dispatch_async: a block would need -fblocks for this translation unit,
+// and there is no reason to depend on that flag for a one-shot callback.
+static void app_hide_deferred_dyld_thread(void *context)
+{
+	(void)context;
+	usleep(150 * 1000);   // dyld's initializer loop is long finished by here
+	app_hide_deferred_dyld_body();
+}
+
+// v17: the deferral moved off the hooked-call path.
+//
+// v16 ran the dyld work from the first hooked call, which is fine for open/fopen (ordinary app
+// code) and is what the crash report demanded instead of doing it in the constructor. v17 also
+// interposes stat, though, and stat is called during libsystem startup - so the same crash could
+// have come back through a different door. A thread that waits 150ms is deterministic for both:
+// whatever the app calls first, dyld has certainly finished when it wakes.
+static void app_hide_schedule_deferred_dyld(void)
+{
+	static bool scheduled = false;
+	if (scheduled) return;
+	scheduled = true;
+
+	dispatch_async_f(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0),
+	                 NULL, (dispatch_function_t)app_hide_deferred_dyld_thread);
+	app_hide_note("install", "dyld image work scheduled on a background thread");
+}
+
 static void app_hide_register_image_callback(void)
 {
 	if (p_objc_getClass && p_sel_registerName && p_class_getInstanceMethod &&
@@ -1125,7 +1228,7 @@ static void app_hide_register_image_callback(void)
 // cannot leave the patched window. Skipping a hook costs coverage; patching a thunk
 // costs the launch.
 #define APP_HIDE_HOOK_MAX 24
-#define APP_HIDE_ENGINE_VERSION "v16"
+#define APP_HIDE_ENGINE_VERSION "v17"
 
 typedef struct {
 	const char *name;
@@ -1337,6 +1440,10 @@ static void app_hide_report_hooks(void)
 	         gHookedCount, gSkippedCount);
 	app_hide_note("install", line);
 
+	// v17: the five the patch guard refuses are covered by the interpose section instead, so the
+	// counts above understate what is live - say so in the log the user can read.
+	app_hide_note("install", "dyld interpose section active (stat/lstat/access/readlink/opendir/open/fopen/fstatat/faccessat/openat/readlinkat/statfs/getattrlist)");
+
 	for (size_t i = 0; i < gAppHideHookCount; i++) {
 		if (gAppHideHooks[i].installed) {
 			snprintf(line, sizeof(line), "%s installed%s", gAppHideHooks[i].name,
@@ -1508,6 +1615,10 @@ void app_hide_install(void)
 		// Moved here in v15: see the note at the default set above.
 		app_hide_hook("fopen",   (void *)fopen,   (void *)app_hide_fopen);
 		app_hide_hook("opendir", (void *)opendir, (void *)app_hide_opendir);
+		// v17: scheduled on a thread first, and kept as a tick backstop for processes without
+		// libdispatch; see app_hide_schedule_deferred_dyld() for why the first hooked call
+		// alone is no longer sufficient now that stat is interposed.
+		app_hide_schedule_deferred_dyld();
 		gAppHideDeferredDyld = true;   // image rewrite + add-image callback: first tick
 		app_hide_note("install", "dyld image work deferred to the first tick");
 
