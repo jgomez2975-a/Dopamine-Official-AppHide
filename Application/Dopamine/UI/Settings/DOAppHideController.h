@@ -15,6 +15,10 @@ NS_ASSUME_NONNULL_BEGIN
 // Documents/AppHideLogs, then reports what it found.
 - (void)appHideExportLogs;
 
+// Tapped row: shows which basebin is really installed (this mod's build or the stock
+// one) plus the panel version. If the basebin is stock, nothing below it can work.
+- (void)appHideEnvironmentCheck;
+
 @end
 
 NS_ASSUME_NONNULL_END

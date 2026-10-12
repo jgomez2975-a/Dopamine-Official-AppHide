@@ -43,6 +43,11 @@ FOUNDATION_EXPORT void DOAppHideTrace(NSString *message);
 // file that nothing ever consults.
 - (NSString *)appHideEnvironmentSelfCheck;
 
+// One word answer for a row title, because a settings footer truncates a multi line
+// string and the verdict then exists but cannot be seen:
+// "魔改版 ✅" / "部分匹配 ⚠️" / "原版 ❌" / "读不到".
+- (NSString *)appHideBasebinVerdict;
+
 // A hidden app can only write inside its own container, so the basebin side logs
 // every path it denied to <container>/Library/Caches/.DopamineAppHide.log. This
 // copies those files into Dopamine's Documents (exposed through the Files app) and

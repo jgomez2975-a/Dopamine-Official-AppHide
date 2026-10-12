@@ -214,6 +214,19 @@ static NSError *sAppHideLastError = nil;
     return [NSString stringWithFormat:@"环境自检：\n%@", result];
 }
 
+- (NSString *)appHideBasebinVerdict
+{
+    NSString *full = [self appHideEnvironmentSelfCheck];
+
+    // Worst case wins: a stock launchdhook next to a modded systemhook still means the
+    // spawn time rules are ignored, which is the failure that matters.
+    if ([full rangeOfString:@"原版 ❌"].location != NSNotFound) return @"原版 ❌";
+    if ([full rangeOfString:@"部分匹配 ⚠️"].location != NSNotFound) return @"部分匹配 ⚠️";
+    if ([full rangeOfString:@"读不到"].location != NSNotFound) return @"读不到";
+    if ([full rangeOfString:@"魔改版 ✅"].location != NSNotFound) return @"魔改版 ✅";
+    return @"未知";
+}
+
 // Files app through UIFileSharingEnabled, which is how the user can see exactly
 // which paths a bank app probed - no Filza, no SSH, no cable.
 static NSString *const kAppHideLogDir  = @"AppHideLogs";

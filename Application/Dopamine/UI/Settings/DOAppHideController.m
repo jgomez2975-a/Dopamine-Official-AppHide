@@ -8,6 +8,11 @@
 #import "DOEnvironmentManager.h"
 #import <UIKit/UIKit.h>
 
+// Version of the panel code itself, shown in the first row. The engine inside the
+// basebin has its own version (it logs "engine vN"), and keeping them visible together
+// is how "the app updated but the basebin did not" stops being invisible.
+#define APP_HIDE_PANEL_VERSION @"v8"
+
 // Name matching for the search field. Substring first, then subsequence, so the
 // short forms people actually type still find the app: "农行" -> 中国农业银行
 // (农 and 行 are in order), "wx" -> WeChat. Bundle identifiers are matched as a
@@ -153,13 +158,31 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
     }
 
     PSSpecifier *headerGroup = [PSSpecifier emptyGroupSpecifier];
-    headerGroup.name = @"App Hiding";
+    // The verdict goes in the row TITLE, not only in the footer: a settings footer is
+    // grey small print that gets truncated, and the user reported exactly that - the
+    // self check was there and could not be seen.
+    headerGroup.name = [NSString stringWithFormat:@"App Hiding %@ — basebin %@",
+                        APP_HIDE_PANEL_VERSION, [envManager appHideBasebinVerdict]];
     [headerGroup setProperty:[NSString stringWithFormat:
                                  @"共 %lu 个 App，已隐藏 %lu 个。隐藏的 App 启动时不会带上越狱环境，改完下次启动生效（不用注销）。\n%@",
                                  (unsigned long)apps.count, (unsigned long)hiddenCount,
                                  [envManager appHideDiagnostics]]
                      forKey:@"footerText"];
     [specifiers addObject:headerGroup];
+
+    // Environment self check as its own row: tap to see which basebin is really
+    // installed. Shown before anything else because if the installed basebin is the
+    // stock one, every switch below writes a rules file that nothing reads.
+    PSSpecifier *checkSpecifier = [PSSpecifier preferenceSpecifierNamed:@"环境自检（点开看 basebin 详情）"
+                                                                 target:self
+                                                                    set:nil
+                                                                    get:nil
+                                                                 detail:nil
+                                                                   cell:PSButtonCell
+                                                                   edit:nil];
+    [checkSpecifier setProperty:@YES forKey:@"enabled"];
+    [checkSpecifier setProperty:NSStringFromSelector(@selector(appHideEnvironmentCheck)) forKey:@"action"];
+    [specifiers addObject:checkSpecifier];
 
     // Log / crash-report export on demand. The copy walks every app container as root
     // and is the slowest thing in this screen, so it is a row the user taps instead of
@@ -264,6 +287,28 @@ static BOOL DOAppHideFuzzyMatch(NSString *haystack, NSString *needle)
 }
 
 #pragma mark - log export
+
+- (void)appHideEnvironmentCheck
+{
+    DOAppHideTrace(@"self-check row tapped");
+
+    DOEnvironmentManager *envManager = [DOEnvironmentManager sharedManager];
+    NSString *detail = [envManager appHideEnvironmentSelfCheck];
+    NSString *verdict = [envManager appHideBasebinVerdict];
+
+    NSString *message = [NSString stringWithFormat:
+                         @"面板版本：%@\nbasebin 判定：%@\n\n%@\n\n"
+                         @"说明：魔改版 ✅ = 装上的 basebin 是这一版（开关才会真的生效）；"
+                         @"原版 ❌ = App 换了但 basebin 没换，回 Dopamine 首页点一次 Update Environment 再 respring。",
+                         APP_HIDE_PANEL_VERSION, verdict, detail];
+    DOAppHideTrace([@"self-check: " stringByAppendingString:verdict]);
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"环境自检"
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
 
 - (void)appHideExportLogs
 {
