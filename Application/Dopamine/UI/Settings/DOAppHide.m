@@ -25,9 +25,47 @@
     return APP_HIDE_RULES_PATH;
 }
 
+// Out-of-container access on a jailbroken device needs BOTH escalations, in this
+// order:
+//   * root first - the jbserver's ROOT domain rejects any client whose euid is not
+//     0 (BaseBin/launchdhook/src/jbserver/jbdomain_root.c: root_domain_allowed is
+//     `audit_token_to_euid(clientToken) == 0`), and
+//   * then the sandbox drop - the MAC label, not the uid, is what blocks
+//     /var/mobile/Library/Preferences.
+// Stock Dopamine's runUnsandboxed: on its own is only sufficient for a TrollStore
+// install, where the app already carries com.apple.private.security.no-sandbox.
+// A self signed install has neither that entitlement nor root, so the label call
+// is refused and the read stays sandboxed -> every switch renders OFF again.
+// Returns YES only when the block really ran.
+- (BOOL)appHideRunEscaped:(void (^)(void))block
+{
+    __block BOOL ran = NO;
+    void (^wrapped)(void) = ^{
+        block();
+        ran = YES;
+    };
+
+    if (geteuid() == 0) {
+        [self runUnsandboxed:wrapped];
+    }
+    else if ([self isJailbroken]) {
+        // runAsRoot: escalates through jbclient_dopamine_get_root(), which patches
+        // the kernel ucred (no entitlement involved: the DOPAMINE domain only
+        // verifies that the caller's executable lives inside Dopamine.app).
+        [self runAsRoot:^{
+            [self runUnsandboxed:wrapped];
+        }];
+    }
+    else {
+        // Not jailbroken: TrollStore installs are already unsandboxed.
+        [self runUnsandboxed:wrapped];
+    }
+    return ran;
+}
+
 // The rules file lives outside the app container. A sandboxed read returns nil
 // even for a 0644 file, which makes every switch render as OFF when the panel is
-// re-entered, so the read has to happen in the same unsandbox scope the write
+// re-entered, so the read has to happen in the same escaped scope the write
 // uses. One read per screen is enough; the cache is dropped on write and when
 // the panel appears.
 static NSDictionary *sAppHideRulesCache = nil;
@@ -41,11 +79,17 @@ static NSError *sAppHideLastError = nil;
 - (NSDictionary<NSString *, NSDictionary *> *)appHideRulesFromDisk
 {
     __block NSDictionary *rules = nil;
-    [self runUnsandboxed:^{
+    BOOL ran = [self appHideRunEscaped:^{
         rules = [NSDictionary dictionaryWithContentsOfFile:APP_HIDE_RULES_PATH];
     }];
     NSDictionary *result = [rules isKindOfClass:[NSDictionary class]] ? rules : @{};
     sAppHideRulesCache = result;
+    if (!ran) {
+        sAppHideLastError = [NSError errorWithDomain:@"AppHide" code:3 userInfo:@{
+            NSLocalizedDescriptionKey: [NSString stringWithFormat:
+                @"could not escalate to read %@ (jailbreak privilege escalation refused)", APP_HIDE_RULES_PATH]
+        }];
+    }
     return result;
 }
 
@@ -113,14 +157,13 @@ static NSError *sAppHideLastError = nil;
         }
     };
 
-    if ([self isJailbroken]) {
-        [self runAsRoot:^{
-            [self runUnsandboxed:work];
+    BOOL ran = [self appHideRunEscaped:work];
+    if (!ran && !writeError) {
+        writeError = [NSError errorWithDomain:@"AppHide" code:3 userInfo:@{
+            NSLocalizedDescriptionKey: [NSString stringWithFormat:
+                @"could not escalate (jailbroken=%d): %@ was not written",
+                (int)[self isJailbroken], APP_HIDE_RULES_PATH]
         }];
-    }
-    else {
-        // Not jailbroken: runUnsandboxed still helps for TrollStore installs
-        [self runUnsandboxed:work];
     }
 
     if (ok) {
@@ -251,7 +294,7 @@ static NSError *sAppHideLastError = nil;
     // the scan (and each Info.plist read) is sandbox-denied until the label is
     // dropped - an empty app list was the visible symptom.
     if (!apps.count) {
-        [self runUnsandboxed:^{
+        [self appHideRunEscaped:^{
             for (NSString *root in @[@"/var/containers/Bundle/Application", @"/private/var/containers/Bundle/Application"]) {
                 NSArray<NSString *> *uuids = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:root error:nil];
                 for (NSString *uuid in uuids) {
